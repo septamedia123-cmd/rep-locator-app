@@ -4,11 +4,19 @@ import gspread
 import folium
 from streamlit_folium import st_folium
 from google.oauth2.service_account import Credentials
+from datetime import datetime
 
-st.set_page_config(page_title="NuLife Rep Locator", layout="wide")
+st.set_page_config(page_title="NuLife Rep Locator", page_icon="📍", layout="wide")
 
 GSHEET_ID = st.secrets["GSHEET_ID"]
 APP_PASSWORD = st.secrets["APP_PASSWORD"]
+
+REP_HEADERS = [
+    "RepID", "Active", "Manager", "Region", "MarketTerritory", "State", "City",
+    "FirstName", "LastName", "FullName", "PhoneNumber", "PersonalEmail",
+    "NuLifeEmail", "LinksHandles", "BusinessName", "Address", "Latitude",
+    "Longitude", "Notes", "StartDate", "LastUpdated"
+]
 
 def get_gsheet_client():
     scopes = [
@@ -22,18 +30,48 @@ def get_gsheet_client():
     return gspread.authorize(creds)
 
 @st.cache_data(ttl=300)
-def load_data():
+def load_reps():
     try:
         gc = get_gsheet_client()
         sheet = gc.open_by_key(GSHEET_ID)
         ws = sheet.worksheet("rep_profiles")
         data = ws.get_all_records()
-        return pd.DataFrame(data)
+        df = pd.DataFrame(data)
+
+        for col in REP_HEADERS:
+            if col not in df.columns:
+                df[col] = ""
+
+        return df[REP_HEADERS]
+
     except Exception as e:
         st.error("Google Sheets connection failed.")
         st.write("Error type:", type(e).__name__)
         st.write("Error details:", str(e))
         st.stop()
+
+def save_reps(df):
+    try:
+        gc = get_gsheet_client()
+        sheet = gc.open_by_key(GSHEET_ID)
+        ws = sheet.worksheet("rep_profiles")
+
+        clean_df = df.copy()
+        for col in REP_HEADERS:
+            if col not in clean_df.columns:
+                clean_df[col] = ""
+
+        clean_df = clean_df[REP_HEADERS].fillna("")
+        ws.clear()
+        ws.update([REP_HEADERS] + clean_df.astype(str).values.tolist())
+        st.cache_data.clear()
+        return True
+
+    except Exception as e:
+        st.error("Could not save data to Google Sheets.")
+        st.write("Error type:", type(e).__name__)
+        st.write("Error details:", str(e))
+        return False
 
 def stable_offset(index):
     offsets = [
@@ -48,7 +86,6 @@ def stable_offset(index):
 def login():
     st.title("NuLife Rep Locator")
     st.caption("Secure access required")
-
     pw = st.text_input("Password", type="password")
 
     if st.button("Login"):
@@ -58,6 +95,9 @@ def login():
         else:
             st.error("Wrong password")
 
+def metric_card(label, value):
+    st.metric(label, value)
+
 if "auth" not in st.session_state:
     st.session_state.auth = False
 
@@ -65,44 +105,111 @@ if not st.session_state.auth:
     login()
     st.stop()
 
-df = load_data()
+df = load_reps()
 
-st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Map", "Data"])
+st.sidebar.title("NuLife Rep Locator")
+page = st.sidebar.radio(
+    "Navigation",
+    ["Dashboard", "Map", "Rep Directory", "Manage Reps"]
+)
 
 if st.sidebar.button("Log out"):
     st.session_state.auth = False
     st.rerun()
 
-if page == "Map":
-    st.title("NuLife Rep Map")
+if st.sidebar.button("Refresh Data"):
+    st.cache_data.clear()
+    st.rerun()
 
-    df["Latitude"] = pd.to_numeric(df["Latitude"], errors="coerce")
-    df["Longitude"] = pd.to_numeric(df["Longitude"], errors="coerce")
-    df = df.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
+# =========================
+# DASHBOARD
+# =========================
+if page == "Dashboard":
+    st.title("Dashboard")
 
-    st.subheader("Filters")
+    working_df = df.copy()
+    working_df["Latitude"] = pd.to_numeric(working_df["Latitude"], errors="coerce")
+    working_df["Longitude"] = pd.to_numeric(working_df["Longitude"], errors="coerce")
 
-    col1, col2, col3 = st.columns(3)
+    active_df = working_df[working_df["Active"].astype(str).str.lower() == "yes"]
+    missing_coords = working_df[
+        working_df["Latitude"].isna() | working_df["Longitude"].isna()
+    ]
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Reps", len(working_df))
+    c2.metric("Active Reps", len(active_df))
+    c3.metric("Markets", working_df["MarketTerritory"].replace("", pd.NA).dropna().nunique())
+    c4.metric("States", working_df["State"].replace("", pd.NA).dropna().nunique())
+    c5.metric("Missing Coordinates", len(missing_coords))
+
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
 
     with col1:
-        states = ["All"] + sorted(df["State"].dropna().astype(str).unique().tolist())
-        selected_state = st.selectbox("Filter by State", states)
+        st.subheader("Reps by Manager")
+        if "Manager" in working_df.columns and not working_df.empty:
+            manager_counts = working_df["Manager"].replace("", "Unassigned").value_counts()
+            st.bar_chart(manager_counts)
 
     with col2:
-        managers = ["All"] + sorted(df["Manager"].dropna().astype(str).unique().tolist())
-        selected_manager = st.selectbox("Filter by Manager", managers)
+        st.subheader("Reps by State")
+        if "State" in working_df.columns and not working_df.empty:
+            state_counts = working_df["State"].replace("", "Unknown").value_counts()
+            st.bar_chart(state_counts)
+
+    st.markdown("---")
+    st.subheader("Data Alerts")
+
+    if missing_coords.empty:
+        st.success("All reps have map coordinates.")
+    else:
+        st.warning(f"{len(missing_coords)} rep(s) are missing Latitude/Longitude.")
+        st.dataframe(
+            missing_coords[["RepID", "FullName", "MarketTerritory", "State", "City", "Latitude", "Longitude"]],
+            use_container_width=True
+        )
+
+# =========================
+# MAP
+# =========================
+elif page == "Map":
+    st.title("NuLife Rep Map")
+
+    map_df = df.copy()
+    map_df["Latitude"] = pd.to_numeric(map_df["Latitude"], errors="coerce")
+    map_df["Longitude"] = pd.to_numeric(map_df["Longitude"], errors="coerce")
+    map_df = map_df.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
+
+    st.subheader("Filters")
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        states = ["All"] + sorted(map_df["State"].dropna().astype(str).unique().tolist())
+        selected_state = st.selectbox("State", states)
+
+    with col2:
+        managers = ["All"] + sorted(map_df["Manager"].dropna().astype(str).unique().tolist())
+        selected_manager = st.selectbox("Manager", managers)
 
     with col3:
-        search = st.text_input("Search Rep / Territory")
+        regions = ["All"] + sorted(map_df["Region"].dropna().astype(str).unique().tolist())
+        selected_region = st.selectbox("Region", regions)
 
-    filtered_df = df.copy()
+    with col4:
+        search = st.text_input("Search")
+
+    filtered_df = map_df.copy()
 
     if selected_state != "All":
         filtered_df = filtered_df[filtered_df["State"].astype(str) == selected_state]
 
     if selected_manager != "All":
         filtered_df = filtered_df[filtered_df["Manager"].astype(str) == selected_manager]
+
+    if selected_region != "All":
+        filtered_df = filtered_df[filtered_df["Region"].astype(str) == selected_region]
 
     if search:
         mask = filtered_df.astype(str).apply(
@@ -123,9 +230,9 @@ if page == "Map":
         lng = float(row["Longitude"]) + offset_lng
 
         popup_html = f"""
-        <div style="width:260px; font-family: Arial, sans-serif;">
+        <div style="width:270px; font-family: Arial, sans-serif;">
             <h4 style="margin-bottom:6px;">{row.get('FullName', '')}</h4>
-
+            <b>Rep ID:</b> {row.get('RepID', '')}<br>
             <b>Territory:</b> {row.get('MarketTerritory', '')}<br>
             <b>City/State:</b> {row.get('City', '')}, {row.get('State', '')}<br>
             <b>Manager:</b> {row.get('Manager', '')}<br>
@@ -141,18 +248,12 @@ if page == "Map":
 
         folium.Marker(
             [lat, lng],
-            popup=folium.Popup(popup_html, max_width=320),
+            popup=folium.Popup(popup_html, max_width=330),
             tooltip=row.get("FullName", "Rep"),
             icon=folium.Icon(color="blue", icon="flag")
         ).add_to(m)
 
-    st_folium(
-        m,
-        width=1100,
-        height=650,
-        returned_objects=[],
-        key="rep_map"
-    )
+    st_folium(m, width=1150, height=650, returned_objects=[], key="rep_map")
 
     st.markdown("---")
     st.subheader("Rep Profiles")
@@ -182,22 +283,83 @@ if page == "Map":
                 st.write("**Notes:**")
                 st.write(row.get("Notes", ""))
 
-if page == "Data":
-    st.title("Rep Data")
+# =========================
+# REP DIRECTORY
+# =========================
+elif page == "Rep Directory":
+    st.title("Rep Directory")
 
-    if st.button("Refresh Google Sheet Data"):
-        st.cache_data.clear()
-        st.rerun()
+    search_dir = st.text_input("Search reps, markets, managers, states")
 
-    search_data = st.text_input("Search table")
+    directory_df = df.copy()
 
-    data_df = df.copy()
-
-    if search_data:
-        mask = data_df.astype(str).apply(
-            lambda row: row.str.contains(search_data, case=False, na=False).any(),
+    if search_dir:
+        mask = directory_df.astype(str).apply(
+            lambda row: row.str.contains(search_dir, case=False, na=False).any(),
             axis=1
         )
-        data_df = data_df[mask]
+        directory_df = directory_df[mask]
 
-    st.dataframe(data_df, use_container_width=True)
+    st.markdown(f"### {len(directory_df)} Rep(s)")
+
+    for _, row in directory_df.iterrows():
+        with st.container():
+            st.markdown(
+                f"""
+                <div style="
+                    background:#ffffff;
+                    border:1px solid #e5e7eb;
+                    border-radius:16px;
+                    padding:18px;
+                    margin-bottom:12px;
+                    box-shadow:0 4px 10px rgba(0,0,0,0.04);
+                ">
+                    <div style="font-size:22px; font-weight:800;">
+                        {row.get('FullName', '')}
+                    </div>
+                    <div style="font-size:14px; color:#6b7280; margin-top:4px;">
+                        {row.get('MarketTerritory', '')} • {row.get('City', '')}, {row.get('State', '')} • Manager: {row.get('Manager', '')}
+                    </div>
+                    <div style="margin-top:10px;">
+                        <b>Phone:</b> {row.get('PhoneNumber', '')}<br>
+                        <b>Email:</b> {row.get('PersonalEmail', '')}<br>
+                        <b>NuLife:</b> {row.get('NuLifeEmail', '')}
+                    </div>
+                    <div style="margin-top:10px; color:#374151;">
+                        {row.get('Notes', '')}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+# =========================
+# MANAGE REPS
+# =========================
+elif page == "Manage Reps":
+    st.title("Manage Reps")
+
+    st.info("Edit reps below, then click Save Changes to update Google Sheets.")
+
+    editable_df = df.copy()
+
+    edited_df = st.data_editor(
+        editable_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="rep_editor"
+    )
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("Save Changes", type="primary", use_container_width=True):
+            edited_df["LastUpdated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if save_reps(edited_df):
+                st.success("Rep profiles saved successfully.")
+                st.rerun()
+
+    with c2:
+        if st.button("Discard Changes / Refresh", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
