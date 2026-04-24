@@ -153,6 +153,7 @@ reps_df = load_reps()
 sales_df = clean_sales_df(load_sales())
 
 st.sidebar.title("NuLife Rep Locator")
+st.sidebar.image("logo.png", width=120)
 page = st.sidebar.radio(
     "Navigation",
     ["Dashboard", "Map", "Rep Directory", "Sales Dashboard", "Manage Reps"]
