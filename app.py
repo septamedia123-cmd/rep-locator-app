@@ -37,20 +37,6 @@ def load_data():
         st.write("Error details:", str(e))
         st.stop()
 
-def load_data():
-    try:
-        gc = get_gsheet_client()
-        sheet = gc.open_by_key(GSHEET_ID)
-        ws = sheet.worksheet("rep_profiles")
-        data = ws.get_all_records()
-        return pd.DataFrame(data)
-
-    except Exception as e:
-        st.error("Google Sheets connection failed.")
-        st.write("Error type:", type(e).__name__)
-        st.write("Error details:", str(e))
-        st.stop()
-
 def login():
     st.title("NuLife Rep Locator")
     st.caption("Secure access required")
@@ -87,7 +73,6 @@ if page == "Map":
     df["Longitude"] = pd.to_numeric(df["Longitude"], errors="coerce")
     df = df.dropna(subset=["Latitude", "Longitude"])
 
-    # Filters
     st.subheader("Filters")
 
     col1, col2, col3 = st.columns(3)
@@ -120,11 +105,9 @@ if page == "Map":
 
     st.markdown(f"### Showing {len(filtered_df)} Rep(s)")
 
-    # Map
     m = folium.Map(location=[39.5, -98.35], zoom_start=4)
 
     for _, row in filtered_df.iterrows():
-        # Slight offset so multiple reps in same city do not sit exactly on top of each other
         lat = float(row["Latitude"]) + random.uniform(-0.01, 0.01)
         lng = float(row["Longitude"]) + random.uniform(-0.01, 0.01)
 
@@ -137,20 +120,11 @@ if page == "Map":
             <b>Manager:</b> {row.get('Manager', '')}<br>
             <b>Region:</b> {row.get('Region', '')}<br><br>
 
-            <b>Phone:</b><br>
-            {row.get('PhoneNumber', '')}<br><br>
-
-            <b>Email:</b><br>
-            {row.get('PersonalEmail', '')}<br><br>
-
-            <b>NuLife Email:</b><br>
-            {row.get('NuLifeEmail', '')}<br><br>
-
-            <b>Business:</b><br>
-            {row.get('BusinessName', '')}<br><br>
-
-            <b>Notes:</b><br>
-            {row.get('Notes', '')}
+            <b>Phone:</b><br>{row.get('PhoneNumber', '')}<br><br>
+            <b>Email:</b><br>{row.get('PersonalEmail', '')}<br><br>
+            <b>NuLife Email:</b><br>{row.get('NuLifeEmail', '')}<br><br>
+            <b>Business:</b><br>{row.get('BusinessName', '')}<br><br>
+            <b>Notes:</b><br>{row.get('Notes', '')}
         </div>
         """
 
@@ -163,7 +137,6 @@ if page == "Map":
 
     st_folium(m, width=1100, height=650)
 
-    # Rep cards below map
     st.markdown("---")
     st.subheader("Rep Profiles")
 
@@ -194,6 +167,10 @@ if page == "Map":
 
 if page == "Data":
     st.title("Rep Data")
+
+    if st.button("Refresh Google Sheet Data"):
+        st.cache_data.clear()
+        st.rerun()
 
     search_data = st.text_input("Search table")
 
