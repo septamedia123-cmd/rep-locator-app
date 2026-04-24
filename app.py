@@ -426,6 +426,100 @@ elif page == "Sales Dashboard":
 elif page == "Manage Reps":
     st.title("Manage Reps")
 
+    def generate_next_rep_id(existing_df):
+        existing_ids = existing_df["RepID"].dropna().astype(str).tolist()
+        numbers = []
+
+        for rep_id in existing_ids:
+            if rep_id.startswith("REP-"):
+                try:
+                    numbers.append(int(rep_id.replace("REP-", "")))
+                except:
+                    pass
+
+        next_number = max(numbers) + 1 if numbers else 1
+        return f"REP-{next_number:03d}"
+
+    st.subheader("Add New Rep")
+
+    with st.form("add_rep_form"):
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            first_name = st.text_input("First Name")
+            last_name = st.text_input("Last Name")
+            active = st.selectbox("Active", ["Yes", "No"], index=0)
+            manager = st.text_input("Manager")
+
+        with c2:
+            region = st.text_input("Region")
+            market = st.text_input("Market / Territory")
+            state = st.text_input("State")
+            city = st.text_input("City")
+
+        with c3:
+            phone = st.text_input("Phone Number")
+            personal_email = st.text_input("Personal Email")
+            nulife_email = st.text_input("NuLife Email")
+            links = st.text_input("Links / Handles")
+
+        business = st.text_input("Business Name")
+        address = st.text_input("Address")
+
+        c4, c5 = st.columns(2)
+        with c4:
+            latitude = st.text_input("Latitude")
+        with c5:
+            longitude = st.text_input("Longitude")
+
+        notes = st.text_area("Notes")
+
+        submitted = st.form_submit_button("Add Rep")
+
+        if submitted:
+            if not first_name.strip() or not last_name.strip():
+                st.error("First Name and Last Name are required.")
+            else:
+                new_rep_id = generate_next_rep_id(reps_df)
+                full_name = f"{first_name.strip()} {last_name.strip()}"
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                new_row = {
+                    "RepID": new_rep_id,
+                    "Active": active,
+                    "Manager": manager,
+                    "Region": region,
+                    "MarketTerritory": market,
+                    "State": state,
+                    "City": city,
+                    "FirstName": first_name,
+                    "LastName": last_name,
+                    "FullName": full_name,
+                    "PhoneNumber": phone,
+                    "PersonalEmail": personal_email,
+                    "NuLifeEmail": nulife_email,
+                    "LinksHandles": links,
+                    "BusinessName": business,
+                    "Address": address,
+                    "Latitude": latitude,
+                    "Longitude": longitude,
+                    "Notes": notes,
+                    "StartDate": now,
+                    "LastUpdated": now
+                }
+
+                updated_df = pd.concat(
+                    [reps_df, pd.DataFrame([new_row])],
+                    ignore_index=True
+                )
+
+                if save_reps(updated_df):
+                    st.success(f"Added {full_name} as {new_rep_id}.")
+                    st.rerun()
+
+    st.markdown("---")
+
+    st.subheader("Edit Existing Reps")
     st.info("Edit reps below, then click Save Changes to update Google Sheets.")
 
     editable_df = reps_df.copy()
