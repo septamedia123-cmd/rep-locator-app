@@ -1,4 +1,3 @@
-import random
 import streamlit as st
 import pandas as pd
 import gspread
@@ -30,12 +29,21 @@ def load_data():
         ws = sheet.worksheet("rep_profiles")
         data = ws.get_all_records()
         return pd.DataFrame(data)
-
     except Exception as e:
         st.error("Google Sheets connection failed.")
         st.write("Error type:", type(e).__name__)
         st.write("Error details:", str(e))
         st.stop()
+
+def stable_offset(index):
+    offsets = [
+        (0.0000, 0.0000),
+        (0.0080, 0.0080),
+        (-0.0080, -0.0080),
+        (0.0080, -0.0080),
+        (-0.0080, 0.0080),
+    ]
+    return offsets[index % len(offsets)]
 
 def login():
     st.title("NuLife Rep Locator")
@@ -71,7 +79,7 @@ if page == "Map":
 
     df["Latitude"] = pd.to_numeric(df["Latitude"], errors="coerce")
     df["Longitude"] = pd.to_numeric(df["Longitude"], errors="coerce")
-    df = df.dropna(subset=["Latitude", "Longitude"])
+    df = df.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
 
     st.subheader("Filters")
 
@@ -103,13 +111,16 @@ if page == "Map":
         )
         filtered_df = filtered_df[mask]
 
+    filtered_df = filtered_df.reset_index(drop=True)
+
     st.markdown(f"### Showing {len(filtered_df)} Rep(s)")
 
-    m = folium.Map(location=[39.5, -98.35], zoom_start=4)
+    m = folium.Map(location=[39.5, -98.35], zoom_start=4, tiles="OpenStreetMap")
 
-    for _, row in filtered_df.iterrows():
-        lat = float(row["Latitude"]) + random.uniform(-0.01, 0.01)
-        lng = float(row["Longitude"]) + random.uniform(-0.01, 0.01)
+    for i, (_, row) in enumerate(filtered_df.iterrows()):
+        offset_lat, offset_lng = stable_offset(i)
+        lat = float(row["Latitude"]) + offset_lat
+        lng = float(row["Longitude"]) + offset_lng
 
         popup_html = f"""
         <div style="width:260px; font-family: Arial, sans-serif;">
@@ -135,7 +146,13 @@ if page == "Map":
             icon=folium.Icon(color="blue", icon="flag")
         ).add_to(m)
 
-    st_folium(m, width=1100, height=650)
+    st_folium(
+        m,
+        width=1100,
+        height=650,
+        returned_objects=[],
+        key="rep_map"
+    )
 
     st.markdown("---")
     st.subheader("Rep Profiles")
