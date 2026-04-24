@@ -18,6 +18,11 @@ REP_HEADERS = [
     "Longitude", "Notes", "StartDate", "LastUpdated"
 ]
 
+SALES_HEADERS = [
+    "Date", "RepID", "FullName", "MarketTerritory", "State", "Orders",
+    "Revenue", "Providers", "TopProduct", "LastOrderDate", "AverageOrderValue"
+]
+
 def get_gsheet_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -45,10 +50,28 @@ def load_reps():
         return df[REP_HEADERS]
 
     except Exception as e:
-        st.error("Google Sheets connection failed.")
+        st.error("Google Sheets rep_profiles connection failed.")
         st.write("Error type:", type(e).__name__)
         st.write("Error details:", str(e))
         st.stop()
+
+@st.cache_data(ttl=300)
+def load_sales():
+    try:
+        gc = get_gsheet_client()
+        sheet = gc.open_by_key(GSHEET_ID)
+        ws = sheet.worksheet("rep_sales")
+        data = ws.get_all_records()
+        df = pd.DataFrame(data)
+
+        for col in SALES_HEADERS:
+            if col not in df.columns:
+                df[col] = ""
+
+        return df[SALES_HEADERS]
+
+    except Exception:
+        return pd.DataFrame(columns=SALES_HEADERS)
 
 def save_reps(df):
     try:
@@ -83,9 +106,25 @@ def stable_offset(index):
     ]
     return offsets[index % len(offsets)]
 
+def clean_sales_df(sales_df):
+    df = sales_df.copy()
+
+    if df.empty:
+        return df
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["LastOrderDate"] = pd.to_datetime(df["LastOrderDate"], errors="coerce")
+    df["Orders"] = pd.to_numeric(df["Orders"], errors="coerce").fillna(0)
+    df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0)
+    df["Providers"] = pd.to_numeric(df["Providers"], errors="coerce").fillna(0)
+    df["AverageOrderValue"] = pd.to_numeric(df["AverageOrderValue"], errors="coerce").fillna(0)
+
+    return df
+
 def login():
     st.title("NuLife Rep Locator")
     st.caption("Secure access required")
+
     pw = st.text_input("Password", type="password")
 
     if st.button("Login"):
@@ -95,9 +134,6 @@ def login():
         else:
             st.error("Wrong password")
 
-def metric_card(label, value):
-    st.metric(label, value)
-
 if "auth" not in st.session_state:
     st.session_state.auth = False
 
@@ -105,12 +141,13 @@ if not st.session_state.auth:
     login()
     st.stop()
 
-df = load_reps()
+reps_df = load_reps()
+sales_df = clean_sales_df(load_sales())
 
 st.sidebar.title("NuLife Rep Locator")
 page = st.sidebar.radio(
     "Navigation",
-    ["Dashboard", "Map", "Rep Directory", "Manage Reps"]
+    ["Dashboard", "Map", "Rep Directory", "Sales Dashboard", "Manage Reps"]
 )
 
 if st.sidebar.button("Log out"):
@@ -127,7 +164,7 @@ if st.sidebar.button("Refresh Data"):
 if page == "Dashboard":
     st.title("Dashboard")
 
-    working_df = df.copy()
+    working_df = reps_df.copy()
     working_df["Latitude"] = pd.to_numeric(working_df["Latitude"], errors="coerce")
     working_df["Longitude"] = pd.to_numeric(working_df["Longitude"], errors="coerce")
 
@@ -136,12 +173,15 @@ if page == "Dashboard":
         working_df["Latitude"].isna() | working_df["Longitude"].isna()
     ]
 
+    total_revenue = sales_df["Revenue"].sum() if not sales_df.empty else 0
+    total_orders = sales_df["Orders"].sum() if not sales_df.empty else 0
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total Reps", len(working_df))
     c2.metric("Active Reps", len(active_df))
     c3.metric("Markets", working_df["MarketTerritory"].replace("", pd.NA).dropna().nunique())
-    c4.metric("States", working_df["State"].replace("", pd.NA).dropna().nunique())
-    c5.metric("Missing Coordinates", len(missing_coords))
+    c4.metric("Total Revenue", f"${total_revenue:,.0f}")
+    c5.metric("Total Orders", f"{int(total_orders):,}")
 
     st.markdown("---")
 
@@ -149,15 +189,16 @@ if page == "Dashboard":
 
     with col1:
         st.subheader("Reps by Manager")
-        if "Manager" in working_df.columns and not working_df.empty:
-            manager_counts = working_df["Manager"].replace("", "Unassigned").value_counts()
-            st.bar_chart(manager_counts)
+        manager_counts = working_df["Manager"].replace("", "Unassigned").value_counts()
+        st.bar_chart(manager_counts)
 
     with col2:
-        st.subheader("Reps by State")
-        if "State" in working_df.columns and not working_df.empty:
-            state_counts = working_df["State"].replace("", "Unknown").value_counts()
-            st.bar_chart(state_counts)
+        st.subheader("Revenue by Rep")
+        if not sales_df.empty:
+            rev_by_rep = sales_df.groupby("FullName")["Revenue"].sum().sort_values(ascending=False)
+            st.bar_chart(rev_by_rep)
+        else:
+            st.info("No sales data yet.")
 
     st.markdown("---")
     st.subheader("Data Alerts")
@@ -177,12 +218,13 @@ if page == "Dashboard":
 elif page == "Map":
     st.title("NuLife Rep Map")
 
-    map_df = df.copy()
+    map_df = reps_df.copy()
     map_df["Latitude"] = pd.to_numeric(map_df["Latitude"], errors="coerce")
     map_df["Longitude"] = pd.to_numeric(map_df["Longitude"], errors="coerce")
     map_df = map_df.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
 
     st.subheader("Filters")
+
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
@@ -229,14 +271,21 @@ elif page == "Map":
         lat = float(row["Latitude"]) + offset_lat
         lng = float(row["Longitude"]) + offset_lng
 
+        rep_sales = sales_df[sales_df["RepID"].astype(str) == str(row.get("RepID", ""))]
+        rep_revenue = rep_sales["Revenue"].sum() if not rep_sales.empty else 0
+        rep_orders = rep_sales["Orders"].sum() if not rep_sales.empty else 0
+
         popup_html = f"""
-        <div style="width:270px; font-family: Arial, sans-serif;">
+        <div style="width:280px; font-family: Arial, sans-serif;">
             <h4 style="margin-bottom:6px;">{row.get('FullName', '')}</h4>
             <b>Rep ID:</b> {row.get('RepID', '')}<br>
             <b>Territory:</b> {row.get('MarketTerritory', '')}<br>
             <b>City/State:</b> {row.get('City', '')}, {row.get('State', '')}<br>
             <b>Manager:</b> {row.get('Manager', '')}<br>
             <b>Region:</b> {row.get('Region', '')}<br><br>
+
+            <b>Total Revenue:</b> ${rep_revenue:,.0f}<br>
+            <b>Total Orders:</b> {int(rep_orders)}<br><br>
 
             <b>Phone:</b><br>{row.get('PhoneNumber', '')}<br><br>
             <b>Email:</b><br>{row.get('PersonalEmail', '')}<br><br>
@@ -248,40 +297,12 @@ elif page == "Map":
 
         folium.Marker(
             [lat, lng],
-            popup=folium.Popup(popup_html, max_width=330),
+            popup=folium.Popup(popup_html, max_width=340),
             tooltip=row.get("FullName", "Rep"),
             icon=folium.Icon(color="blue", icon="flag")
         ).add_to(m)
 
     st_folium(m, width=1150, height=650, returned_objects=[], key="rep_map")
-
-    st.markdown("---")
-    st.subheader("Rep Profiles")
-
-    if filtered_df.empty:
-        st.info("No reps match the selected filters.")
-    else:
-        for _, row in filtered_df.iterrows():
-            with st.expander(f"{row.get('FullName', '')} — {row.get('MarketTerritory', '')}"):
-                c1, c2 = st.columns(2)
-
-                with c1:
-                    st.write(f"**Rep ID:** {row.get('RepID', '')}")
-                    st.write(f"**Active:** {row.get('Active', '')}")
-                    st.write(f"**Manager:** {row.get('Manager', '')}")
-                    st.write(f"**Region:** {row.get('Region', '')}")
-                    st.write(f"**Territory:** {row.get('MarketTerritory', '')}")
-                    st.write(f"**Location:** {row.get('City', '')}, {row.get('State', '')}")
-
-                with c2:
-                    st.write(f"**Phone:** {row.get('PhoneNumber', '')}")
-                    st.write(f"**Personal Email:** {row.get('PersonalEmail', '')}")
-                    st.write(f"**NuLife Email:** {row.get('NuLifeEmail', '')}")
-                    st.write(f"**Business:** {row.get('BusinessName', '')}")
-                    st.write(f"**Links/Handles:** {row.get('LinksHandles', '')}")
-
-                st.write("**Notes:**")
-                st.write(row.get("Notes", ""))
 
 # =========================
 # REP DIRECTORY
@@ -291,7 +312,7 @@ elif page == "Rep Directory":
 
     search_dir = st.text_input("Search reps, markets, managers, states")
 
-    directory_df = df.copy()
+    directory_df = reps_df.copy()
 
     if search_dir:
         mask = directory_df.astype(str).apply(
@@ -303,6 +324,10 @@ elif page == "Rep Directory":
     st.markdown(f"### {len(directory_df)} Rep(s)")
 
     for _, row in directory_df.iterrows():
+        rep_sales = sales_df[sales_df["RepID"].astype(str) == str(row.get("RepID", ""))]
+        rep_revenue = rep_sales["Revenue"].sum() if not rep_sales.empty else 0
+        rep_orders = rep_sales["Orders"].sum() if not rep_sales.empty else 0
+
         with st.container():
             st.markdown(
                 f"""
@@ -321,6 +346,10 @@ elif page == "Rep Directory":
                         {row.get('MarketTerritory', '')} • {row.get('City', '')}, {row.get('State', '')} • Manager: {row.get('Manager', '')}
                     </div>
                     <div style="margin-top:10px;">
+                        <b>Revenue:</b> ${rep_revenue:,.0f} &nbsp; | &nbsp;
+                        <b>Orders:</b> {int(rep_orders)}
+                    </div>
+                    <div style="margin-top:10px;">
                         <b>Phone:</b> {row.get('PhoneNumber', '')}<br>
                         <b>Email:</b> {row.get('PersonalEmail', '')}<br>
                         <b>NuLife:</b> {row.get('NuLifeEmail', '')}
@@ -334,6 +363,64 @@ elif page == "Rep Directory":
             )
 
 # =========================
+# SALES DASHBOARD
+# =========================
+elif page == "Sales Dashboard":
+    st.title("Sales Dashboard")
+
+    if sales_df.empty:
+        st.warning("No sales data found in rep_sales.")
+        st.stop()
+
+    total_revenue = sales_df["Revenue"].sum()
+    total_orders = sales_df["Orders"].sum()
+    total_providers = sales_df["Providers"].sum()
+    avg_order_value = total_revenue / total_orders if total_orders else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Revenue", f"${total_revenue:,.0f}")
+    c2.metric("Total Orders", f"{int(total_orders):,}")
+    c3.metric("Providers", f"{int(total_providers):,}")
+    c4.metric("Avg Order Value", f"${avg_order_value:,.0f}")
+
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Rep Leaderboard")
+        leaderboard = sales_df.groupby("FullName", as_index=False).agg({
+            "Revenue": "sum",
+            "Orders": "sum",
+            "Providers": "sum"
+        }).sort_values("Revenue", ascending=False)
+
+        st.dataframe(leaderboard, use_container_width=True)
+
+    with col2:
+        st.subheader("Revenue by Territory")
+        territory_sales = sales_df.groupby("MarketTerritory")["Revenue"].sum().sort_values(ascending=False)
+        st.bar_chart(territory_sales)
+
+    st.markdown("---")
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.subheader("Orders by Rep")
+        orders_by_rep = sales_df.groupby("FullName")["Orders"].sum().sort_values(ascending=False)
+        st.bar_chart(orders_by_rep)
+
+    with col4:
+        st.subheader("Top Products")
+        top_products = sales_df.groupby("TopProduct")["Revenue"].sum().sort_values(ascending=False)
+        st.bar_chart(top_products)
+
+    st.markdown("---")
+    st.subheader("Raw Sales Data")
+    st.dataframe(sales_df, use_container_width=True)
+
+# =========================
 # MANAGE REPS
 # =========================
 elif page == "Manage Reps":
@@ -341,7 +428,7 @@ elif page == "Manage Reps":
 
     st.info("Edit reps below, then click Save Changes to update Google Sheets.")
 
-    editable_df = df.copy()
+    editable_df = reps_df.copy()
 
     edited_df = st.data_editor(
         editable_df,
