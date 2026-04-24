@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import pandas as pd
 import gspread
@@ -8,10 +9,13 @@ from datetime import datetime
 
 st.set_page_config(page_title="NuLife Rep Locator", page_icon="📍", layout="wide")
 
-col1, col2, col3 = st.columns([1,2,1])
-
-with col2:
-    st.image("logo.png", width=200)
+# =========================
+# BRAND HEADER
+# =========================
+if os.path.exists("logo.png"):
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.image("logo.png", width=200)
 
 st.markdown("<h2 style='text-align: center;'>NuLife Rep Locator</h2>", unsafe_allow_html=True)
 st.markdown("---")
@@ -31,6 +35,9 @@ SALES_HEADERS = [
     "Revenue", "Providers", "TopProduct", "LastOrderDate", "AverageOrderValue"
 ]
 
+# =========================
+# GOOGLE SHEETS
+# =========================
 def get_gsheet_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -104,6 +111,9 @@ def save_reps(df):
         st.write("Error details:", str(e))
         return False
 
+# =========================
+# HELPERS
+# =========================
 def stable_offset(index):
     offsets = [
         (0.0000, 0.0000),
@@ -129,6 +139,23 @@ def clean_sales_df(sales_df):
 
     return df
 
+def generate_next_rep_id(existing_df):
+    existing_ids = existing_df["RepID"].dropna().astype(str).tolist()
+    numbers = []
+
+    for rep_id in existing_ids:
+        if rep_id.startswith("REP-"):
+            try:
+                numbers.append(int(rep_id.replace("REP-", "")))
+            except:
+                pass
+
+    next_number = max(numbers) + 1 if numbers else 1
+    return f"REP-{next_number:03d}"
+
+# =========================
+# LOGIN
+# =========================
 def login():
     st.title("NuLife Rep Locator")
     st.caption("Secure access required")
@@ -149,11 +176,20 @@ if not st.session_state.auth:
     login()
     st.stop()
 
+# =========================
+# LOAD DATA
+# =========================
 reps_df = load_reps()
 sales_df = clean_sales_df(load_sales())
 
+# =========================
+# SIDEBAR
+# =========================
+if os.path.exists("logo.png"):
+    st.sidebar.image("logo.png", width=120)
+
 st.sidebar.title("NuLife Rep Locator")
-st.sidebar.image("logo.png", width=120)
+
 page = st.sidebar.radio(
     "Navigation",
     ["Dashboard", "Map", "Rep Directory", "Sales Dashboard", "Manage Reps"]
@@ -178,9 +214,6 @@ if page == "Dashboard":
     working_df["Longitude"] = pd.to_numeric(working_df["Longitude"], errors="coerce")
 
     active_df = working_df[working_df["Active"].astype(str).str.lower() == "yes"]
-    missing_coords = working_df[
-        working_df["Latitude"].isna() | working_df["Longitude"].isna()
-    ]
 
     total_revenue = sales_df["Revenue"].sum() if not sales_df.empty else 0
     total_orders = sales_df["Orders"].sum() if not sales_df.empty else 0
@@ -198,28 +231,27 @@ if page == "Dashboard":
 
     with col1:
         st.subheader("Reps by Manager")
-        manager_counts = working_df["Manager"].replace("", "Unassigned").value_counts()
-        st.bar_chart(manager_counts)
+        st.bar_chart(working_df["Manager"].replace("", "Unassigned").value_counts())
 
     with col2:
         st.subheader("Revenue by Rep")
         if not sales_df.empty:
-            rev_by_rep = sales_df.groupby("FullName")["Revenue"].sum().sort_values(ascending=False)
-            st.bar_chart(rev_by_rep)
+            st.bar_chart(sales_df.groupby("FullName")["Revenue"].sum().sort_values(ascending=False))
         else:
             st.info("No sales data yet.")
 
     st.markdown("---")
-    st.subheader("Data Alerts")
 
+    missing_coords = working_df[
+        working_df["Latitude"].isna() | working_df["Longitude"].isna()
+    ]
+
+    st.subheader("Data Alerts")
     if missing_coords.empty:
         st.success("All reps have map coordinates.")
     else:
         st.warning(f"{len(missing_coords)} rep(s) are missing Latitude/Longitude.")
-        st.dataframe(
-            missing_coords[["RepID", "FullName", "MarketTerritory", "State", "City", "Latitude", "Longitude"]],
-            use_container_width=True
-        )
+        st.dataframe(missing_coords, use_container_width=True)
 
 # =========================
 # MAP
@@ -286,16 +318,14 @@ elif page == "Map":
 
         popup_html = f"""
         <div style="width:280px; font-family: Arial, sans-serif;">
-            <h4 style="margin-bottom:6px;">{row.get('FullName', '')}</h4>
+            <h4>{row.get('FullName', '')}</h4>
             <b>Rep ID:</b> {row.get('RepID', '')}<br>
             <b>Territory:</b> {row.get('MarketTerritory', '')}<br>
             <b>City/State:</b> {row.get('City', '')}, {row.get('State', '')}<br>
             <b>Manager:</b> {row.get('Manager', '')}<br>
             <b>Region:</b> {row.get('Region', '')}<br><br>
-
             <b>Total Revenue:</b> ${rep_revenue:,.0f}<br>
             <b>Total Orders:</b> {int(rep_orders)}<br><br>
-
             <b>Phone:</b><br>{row.get('PhoneNumber', '')}<br><br>
             <b>Email:</b><br>{row.get('PersonalEmail', '')}<br><br>
             <b>NuLife Email:</b><br>{row.get('NuLifeEmail', '')}<br><br>
@@ -320,7 +350,6 @@ elif page == "Rep Directory":
     st.title("Rep Directory")
 
     search_dir = st.text_input("Search reps, markets, managers, states")
-
     directory_df = reps_df.copy()
 
     if search_dir:
@@ -337,39 +366,38 @@ elif page == "Rep Directory":
         rep_revenue = rep_sales["Revenue"].sum() if not rep_sales.empty else 0
         rep_orders = rep_sales["Orders"].sum() if not rep_sales.empty else 0
 
-        with st.container():
-            st.markdown(
-                f"""
-                <div style="
-                    background:#ffffff;
-                    border:1px solid #e5e7eb;
-                    border-radius:16px;
-                    padding:18px;
-                    margin-bottom:12px;
-                    box-shadow:0 4px 10px rgba(0,0,0,0.04);
-                ">
-                    <div style="font-size:22px; font-weight:800;">
-                        {row.get('FullName', '')}
-                    </div>
-                    <div style="font-size:14px; color:#6b7280; margin-top:4px;">
-                        {row.get('MarketTerritory', '')} • {row.get('City', '')}, {row.get('State', '')} • Manager: {row.get('Manager', '')}
-                    </div>
-                    <div style="margin-top:10px;">
-                        <b>Revenue:</b> ${rep_revenue:,.0f} &nbsp; | &nbsp;
-                        <b>Orders:</b> {int(rep_orders)}
-                    </div>
-                    <div style="margin-top:10px;">
-                        <b>Phone:</b> {row.get('PhoneNumber', '')}<br>
-                        <b>Email:</b> {row.get('PersonalEmail', '')}<br>
-                        <b>NuLife:</b> {row.get('NuLifeEmail', '')}
-                    </div>
-                    <div style="margin-top:10px; color:#374151;">
-                        {row.get('Notes', '')}
-                    </div>
+        st.markdown(
+            f"""
+            <div style="
+                background:#ffffff;
+                border:1px solid #e5e7eb;
+                border-radius:16px;
+                padding:18px;
+                margin-bottom:12px;
+                box-shadow:0 4px 10px rgba(0,0,0,0.04);
+            ">
+                <div style="font-size:22px; font-weight:800;">
+                    {row.get('FullName', '')}
                 </div>
-                """,
-                unsafe_allow_html=True
-            )
+                <div style="font-size:14px; color:#6b7280; margin-top:4px;">
+                    {row.get('MarketTerritory', '')} • {row.get('City', '')}, {row.get('State', '')} • Manager: {row.get('Manager', '')}
+                </div>
+                <div style="margin-top:10px;">
+                    <b>Revenue:</b> ${rep_revenue:,.0f} &nbsp; | &nbsp;
+                    <b>Orders:</b> {int(rep_orders)}
+                </div>
+                <div style="margin-top:10px;">
+                    <b>Phone:</b> {row.get('PhoneNumber', '')}<br>
+                    <b>Email:</b> {row.get('PersonalEmail', '')}<br>
+                    <b>NuLife:</b> {row.get('NuLifeEmail', '')}
+                </div>
+                <div style="margin-top:10px; color:#374151;">
+                    {row.get('Notes', '')}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
 # =========================
 # SALES DASHBOARD
@@ -403,13 +431,11 @@ elif page == "Sales Dashboard":
             "Orders": "sum",
             "Providers": "sum"
         }).sort_values("Revenue", ascending=False)
-
         st.dataframe(leaderboard, use_container_width=True)
 
     with col2:
         st.subheader("Revenue by Territory")
-        territory_sales = sales_df.groupby("MarketTerritory")["Revenue"].sum().sort_values(ascending=False)
-        st.bar_chart(territory_sales)
+        st.bar_chart(sales_df.groupby("MarketTerritory")["Revenue"].sum().sort_values(ascending=False))
 
     st.markdown("---")
 
@@ -417,13 +443,11 @@ elif page == "Sales Dashboard":
 
     with col3:
         st.subheader("Orders by Rep")
-        orders_by_rep = sales_df.groupby("FullName")["Orders"].sum().sort_values(ascending=False)
-        st.bar_chart(orders_by_rep)
+        st.bar_chart(sales_df.groupby("FullName")["Orders"].sum().sort_values(ascending=False))
 
     with col4:
         st.subheader("Top Products")
-        top_products = sales_df.groupby("TopProduct")["Revenue"].sum().sort_values(ascending=False)
-        st.bar_chart(top_products)
+        st.bar_chart(sales_df.groupby("TopProduct")["Revenue"].sum().sort_values(ascending=False))
 
     st.markdown("---")
     st.subheader("Raw Sales Data")
@@ -434,20 +458,6 @@ elif page == "Sales Dashboard":
 # =========================
 elif page == "Manage Reps":
     st.title("Manage Reps")
-
-    def generate_next_rep_id(existing_df):
-        existing_ids = existing_df["RepID"].dropna().astype(str).tolist()
-        numbers = []
-
-        for rep_id in existing_ids:
-            if rep_id.startswith("REP-"):
-                try:
-                    numbers.append(int(rep_id.replace("REP-", "")))
-                except:
-                    pass
-
-        next_number = max(numbers) + 1 if numbers else 1
-        return f"REP-{next_number:03d}"
 
     st.subheader("Add New Rep")
 
@@ -482,7 +492,6 @@ elif page == "Manage Reps":
             longitude = st.text_input("Longitude")
 
         notes = st.text_area("Notes")
-
         submitted = st.form_submit_button("Add Rep")
 
         if submitted:
@@ -517,10 +526,7 @@ elif page == "Manage Reps":
                     "LastUpdated": now
                 }
 
-                updated_df = pd.concat(
-                    [reps_df, pd.DataFrame([new_row])],
-                    ignore_index=True
-                )
+                updated_df = pd.concat([reps_df, pd.DataFrame([new_row])], ignore_index=True)
 
                 if save_reps(updated_df):
                     st.success(f"Added {full_name} as {new_rep_id}.")
@@ -531,10 +537,8 @@ elif page == "Manage Reps":
     st.subheader("Edit Existing Reps")
     st.info("Edit reps below, then click Save Changes to update Google Sheets.")
 
-    editable_df = reps_df.copy()
-
     edited_df = st.data_editor(
-        editable_df,
+        reps_df.copy(),
         use_container_width=True,
         num_rows="dynamic",
         key="rep_editor"
