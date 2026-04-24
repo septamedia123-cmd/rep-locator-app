@@ -23,11 +23,18 @@ def get_gsheet_client():
     return gspread.authorize(creds)
 
 def load_data():
-    gc = get_gsheet_client()
-    sheet = gc.open_by_key(GSHEET_ID)
-    ws = sheet.worksheet("rep_profiles")
-    data = ws.get_all_records()
-    return pd.DataFrame(data)
+    try:
+        gc = get_gsheet_client()
+        sheet = gc.open_by_key(GSHEET_ID)
+        ws = sheet.worksheet("rep_profiles")
+        data = ws.get_all_records()
+        return pd.DataFrame(data)
+
+    except Exception as e:
+        st.error("Google Sheets connection failed.")
+        st.write("Error type:", type(e).__name__)
+        st.write("Error details:", str(e))
+        st.stop()
 
 def login():
     st.title("NuLife Rep Locator")
