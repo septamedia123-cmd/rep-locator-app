@@ -8,6 +8,14 @@ from datetime import datetime
 
 st.set_page_config(page_title="NuLife Rep Locator", page_icon="📍", layout="wide")
 
+col1, col2, col3 = st.columns([1,2,1])
+
+with col2:
+    st.image("logo.png", width=200)
+
+st.markdown("<h2 style='text-align: center;'>NuLife Rep Locator</h2>", unsafe_allow_html=True)
+st.markdown("---")
+
 GSHEET_ID = st.secrets["GSHEET_ID"]
 APP_PASSWORD = st.secrets["APP_PASSWORD"]
 
