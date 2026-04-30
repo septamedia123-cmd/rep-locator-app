@@ -10,15 +10,104 @@ from datetime import datetime
 st.set_page_config(page_title="NuLife Rep Locator", page_icon="📍", layout="wide")
 
 # =========================
+# PREMIUM APP STYLING
+# =========================
+st.markdown("""
+<style>
+    .stApp {
+        background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+    }
+
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #071827 0%, #0f2a3d 100%);
+    }
+
+    section[data-testid="stSidebar"] * {
+        color: white !important;
+    }
+
+    h1, h2, h3 {
+        color: #0f172a;
+        font-weight: 800;
+    }
+
+    div[data-testid="stMetric"] {
+        background: white;
+        border: 1px solid #e5e7eb;
+        padding: 18px;
+        border-radius: 18px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+    }
+
+    .stButton > button {
+        border-radius: 12px;
+        border: none;
+        background: #0f2a3d;
+        color: white;
+        font-weight: 700;
+        padding: 0.6rem 1rem;
+    }
+
+    .stButton > button:hover {
+        background: #14415f;
+        color: white;
+    }
+
+    div[data-testid="stDataFrame"] {
+        border-radius: 16px;
+        overflow: hidden;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+    }
+
+    .block-container {
+        padding-top: 2rem;
+    }
+
+    hr {
+        border: none;
+        border-top: 1px solid #dbe3ec;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
 # BRAND HEADER
 # =========================
-if os.path.exists("logo.png"):
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.image("logo.png", width=200)
+st.markdown("""
+<div style="
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 22px;
+    padding: 22px 28px;
+    margin-bottom: 24px;
+    box-shadow: 0 10px 28px rgba(15, 23, 42, 0.07);
+">
+""", unsafe_allow_html=True)
 
-st.markdown("<h2 style='text-align: center;'>NuLife Rep Locator</h2>", unsafe_allow_html=True)
-st.markdown("---")
+if os.path.exists("logo.png"):
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        st.image("logo.png", width=150)
+    with col2:
+        st.markdown("""
+        <div style="font-size: 34px; font-weight: 900; color: #0f172a; padding-top: 14px;">
+            NuLife Rep Locator
+        </div>
+        <div style="font-size: 15px; color: #64748b; margin-top: 4px;">
+            Sales territory mapping, rep profiles, and performance visibility
+        </div>
+        """, unsafe_allow_html=True)
+else:
+    st.markdown("""
+    <div style="font-size: 34px; font-weight: 900; color: #0f172a;">
+        NuLife Rep Locator
+    </div>
+    <div style="font-size: 15px; color: #64748b; margin-top: 4px;">
+        Sales territory mapping, rep profiles, and performance visibility
+    </div>
+    """, unsafe_allow_html=True)
+
+st.markdown("</div>", unsafe_allow_html=True)
 
 GSHEET_ID = st.secrets["GSHEET_ID"]
 APP_PASSWORD = st.secrets["APP_PASSWORD"]
