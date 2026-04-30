@@ -10,53 +10,62 @@ from datetime import datetime
 st.set_page_config(page_title="NuLife Rep Locator", page_icon="📍", layout="wide")
 
 # =========================
-# PREMIUM APP STYLING
+# DARK PREMIUM APP STYLING
 # =========================
 st.markdown("""
 <style>
     .stApp {
-        background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+        background: linear-gradient(180deg, #020617 0%, #071827 100%);
+        color: #e2e8f0;
     }
 
     section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #071827 0%, #0f2a3d 100%);
+        background: linear-gradient(180deg, #020617 0%, #0f2a3d 100%);
     }
 
     section[data-testid="stSidebar"] * {
-        color: white !important;
+        color: #e2e8f0 !important;
     }
 
-    h1, h2, h3 {
-        color: #0f172a;
+    h1, h2, h3, h4 {
+        color: #f8fafc !important;
         font-weight: 800;
     }
 
+    p, label, span, div {
+        color: inherit;
+    }
+
     div[data-testid="stMetric"] {
-        background: white;
-        border: 1px solid #e5e7eb;
+        background: #0f172a;
+        border: 1px solid #1e293b;
         padding: 18px;
         border-radius: 18px;
-        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    }
+
+    div[data-testid="stMetric"] * {
+        color: #f8fafc !important;
     }
 
     .stButton > button {
         border-radius: 12px;
         border: none;
-        background: #0f2a3d;
-        color: white;
-        font-weight: 700;
+        background: #22c55e;
+        color: #020617;
+        font-weight: 800;
         padding: 0.6rem 1rem;
     }
 
     .stButton > button:hover {
-        background: #14415f;
+        background: #16a34a;
         color: white;
     }
 
     div[data-testid="stDataFrame"] {
         border-radius: 16px;
         overflow: hidden;
-        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.35);
     }
 
     .block-container {
@@ -65,44 +74,71 @@ st.markdown("""
 
     hr {
         border: none;
-        border-top: 1px solid #dbe3ec;
+        border-top: 1px solid #1e293b;
+    }
+
+    .premium-card {
+        background: #0f172a;
+        border: 1px solid #1e293b;
+        border-radius: 18px;
+        padding: 18px;
+        margin-bottom: 14px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+        color: #e2e8f0;
+    }
+
+    .premium-card-title {
+        font-size: 22px;
+        font-weight: 900;
+        color: #f8fafc;
+    }
+
+    .premium-card-subtitle {
+        font-size: 14px;
+        color: #94a3b8;
+        margin-top: 4px;
+    }
+
+    .premium-card-body {
+        margin-top: 10px;
+        color: #cbd5e1;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # =========================
-# BRAND HEADER
+# DARK HEADER
 # =========================
 st.markdown("""
 <div style="
-    background: white;
-    border: 1px solid #e5e7eb;
+    background: linear-gradient(135deg, #071827 0%, #0f172a 100%);
+    border: 1px solid #1e293b;
     border-radius: 22px;
     padding: 22px 28px;
     margin-bottom: 24px;
-    box-shadow: 0 10px 28px rgba(15, 23, 42, 0.07);
+    box-shadow: 0 10px 40px rgba(0,0,0,0.55);
 ">
 """, unsafe_allow_html=True)
 
 if os.path.exists("logo.png"):
     col1, col2 = st.columns([1, 5])
     with col1:
-        st.image("logo.png", width=150)
+        st.image("logo.png", width=130)
     with col2:
         st.markdown("""
-        <div style="font-size: 34px; font-weight: 900; color: #0f172a; padding-top: 14px;">
+        <div style="font-size: 34px; font-weight: 900; color: white; padding-top: 10px;">
             NuLife Rep Locator
         </div>
-        <div style="font-size: 15px; color: #64748b; margin-top: 4px;">
+        <div style="font-size: 15px; color: #94a3b8; margin-top: 4px;">
             Sales territory mapping, rep profiles, and performance visibility
         </div>
         """, unsafe_allow_html=True)
 else:
     st.markdown("""
-    <div style="font-size: 34px; font-weight: 900; color: #0f172a;">
+    <div style="font-size: 34px; font-weight: 900; color: white;">
         NuLife Rep Locator
     </div>
-    <div style="font-size: 15px; color: #64748b; margin-top: 4px;">
+    <div style="font-size: 15px; color: #94a3b8; margin-top: 4px;">
         Sales territory mapping, rep profiles, and performance visibility
     </div>
     """, unsafe_allow_html=True)
@@ -124,9 +160,6 @@ SALES_HEADERS = [
     "Revenue", "Providers", "TopProduct", "LastOrderDate", "AverageOrderValue"
 ]
 
-# =========================
-# GOOGLE SHEETS
-# =========================
 def get_gsheet_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -200,9 +233,6 @@ def save_reps(df):
         st.write("Error details:", str(e))
         return False
 
-# =========================
-# HELPERS
-# =========================
 def stable_offset(index):
     offsets = [
         (0.0000, 0.0000),
@@ -242,9 +272,6 @@ def generate_next_rep_id(existing_df):
     next_number = max(numbers) + 1 if numbers else 1
     return f"REP-{next_number:03d}"
 
-# =========================
-# LOGIN
-# =========================
 def login():
     st.title("NuLife Rep Locator")
     st.caption("Secure access required")
@@ -265,15 +292,9 @@ if not st.session_state.auth:
     login()
     st.stop()
 
-# =========================
-# LOAD DATA
-# =========================
 reps_df = load_reps()
 sales_df = clean_sales_df(load_sales())
 
-# =========================
-# SIDEBAR
-# =========================
 if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", width=120)
 
@@ -292,9 +313,6 @@ if st.sidebar.button("Refresh Data"):
     st.cache_data.clear()
     st.rerun()
 
-# =========================
-# DASHBOARD
-# =========================
 if page == "Dashboard":
     st.title("Dashboard")
 
@@ -342,9 +360,6 @@ if page == "Dashboard":
         st.warning(f"{len(missing_coords)} rep(s) are missing Latitude/Longitude.")
         st.dataframe(missing_coords, use_container_width=True)
 
-# =========================
-# MAP
-# =========================
 elif page == "Map":
     st.title("NuLife Rep Map")
 
@@ -432,9 +447,6 @@ elif page == "Map":
 
     st_folium(m, width=1150, height=650, returned_objects=[], key="rep_map")
 
-# =========================
-# REP DIRECTORY
-# =========================
 elif page == "Rep Directory":
     st.title("Rep Directory")
 
@@ -457,30 +469,17 @@ elif page == "Rep Directory":
 
         st.markdown(
             f"""
-            <div style="
-                background:#ffffff;
-                border:1px solid #e5e7eb;
-                border-radius:16px;
-                padding:18px;
-                margin-bottom:12px;
-                box-shadow:0 4px 10px rgba(0,0,0,0.04);
-            ">
-                <div style="font-size:22px; font-weight:800;">
-                    {row.get('FullName', '')}
-                </div>
-                <div style="font-size:14px; color:#6b7280; margin-top:4px;">
+            <div class="premium-card">
+                <div class="premium-card-title">{row.get('FullName', '')}</div>
+                <div class="premium-card-subtitle">
                     {row.get('MarketTerritory', '')} • {row.get('City', '')}, {row.get('State', '')} • Manager: {row.get('Manager', '')}
                 </div>
-                <div style="margin-top:10px;">
+                <div class="premium-card-body">
                     <b>Revenue:</b> ${rep_revenue:,.0f} &nbsp; | &nbsp;
-                    <b>Orders:</b> {int(rep_orders)}
-                </div>
-                <div style="margin-top:10px;">
+                    <b>Orders:</b> {int(rep_orders)}<br><br>
                     <b>Phone:</b> {row.get('PhoneNumber', '')}<br>
                     <b>Email:</b> {row.get('PersonalEmail', '')}<br>
-                    <b>NuLife:</b> {row.get('NuLifeEmail', '')}
-                </div>
-                <div style="margin-top:10px; color:#374151;">
+                    <b>NuLife:</b> {row.get('NuLifeEmail', '')}<br><br>
                     {row.get('Notes', '')}
                 </div>
             </div>
@@ -488,9 +487,6 @@ elif page == "Rep Directory":
             unsafe_allow_html=True
         )
 
-# =========================
-# SALES DASHBOARD
-# =========================
 elif page == "Sales Dashboard":
     st.title("Sales Dashboard")
 
@@ -542,9 +538,6 @@ elif page == "Sales Dashboard":
     st.subheader("Raw Sales Data")
     st.dataframe(sales_df, use_container_width=True)
 
-# =========================
-# MANAGE REPS
-# =========================
 elif page == "Manage Reps":
     st.title("Manage Reps")
 
