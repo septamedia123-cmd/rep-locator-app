@@ -1,6 +1,8 @@
 streamlit
 pandas
 gspread
-google-auth
 folium
 streamlit-folium
+google-auth
+google-api-python-client
+openpyxl
