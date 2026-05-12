@@ -816,9 +816,9 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
                 for cell in row:
                     new_cell = dst_ws.cell(cell.row, cell.column, cell.value)
                     if cell.has_style:
-                        new_cell._style = cell._style.copy()
+                        new_cell._style = copy(cell._style)
                     new_cell.number_format = cell.number_format
-                    new_cell.alignment = cell.alignment.copy()
+                    new_cell.alignment = copy(cell.alignment)
             for col_key, dim in src_ws.column_dimensions.items():
                 dst_ws.column_dimensions[col_key].width = dim.width
             dst_ws.freeze_panes = src_ws.freeze_panes
