@@ -7,6 +7,21 @@ from streamlit_folium import st_folium
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 
+import io
+import csv
+import re
+import zipfile
+import smtplib
+import tempfile
+import shutil
+from collections import defaultdict
+from email.message import EmailMessage
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
 st.set_page_config(page_title="NuLife Rep Locator", page_icon="📍", layout="wide")
 
 # =========================
@@ -272,6 +287,733 @@ def generate_next_rep_id(existing_df):
     next_number = max(numbers) + 1 if numbers else 1
     return f"REP-{next_number:03d}"
 
+
+# =========================
+# REPORTING ENGINE
+# =========================
+REPORTS_PARENT_FOLDER_ID = st.secrets.get("REPORTS_PARENT_FOLDER_ID", "")
+SENDER_EMAIL = st.secrets.get("SENDER_EMAIL", "")
+SENDER_APP_PASSWORD = st.secrets.get("SENDER_APP_PASSWORD", "")
+
+COMMISSION_LEVELS = {
+    1: {"name": 20, "pct": 21, "comm": 22},  # U-W
+    2: {"name": 23, "pct": 24, "comm": 25},  # X-Z
+    3: {"name": 26, "pct": 27, "comm": 28},  # AA-AC
+    4: {"name": 29, "pct": 30, "comm": 31},  # AD-AF
+}
+
+ORDER_STATUS_IDX = 17
+SUBTOTAL_IDX = 11
+CUSTOMER_EMAIL_IDX = 5
+TRUE_COST_IDX = 44
+
+JOEL_NELSON_RATE = 0.025
+HOWARD_FINDER_RATE = 0.05
+HOWARD_CLIENT_EMAILS = {
+    "shannon@innerglowstudiofl.com",
+    "roxybarberap@gmail.com",
+}
+
+def report_clean(value):
+    return str(value or "").strip()
+
+def report_norm(value):
+    return report_clean(value).lower()
+
+def report_money(value):
+    s = report_clean(value).replace("$", "").replace(",", "").replace(" ", "")
+    if not s:
+        return 0.0
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def safe_filename(value):
+    return re.sub(r"[^A-Za-z0-9._ -]+", "", report_clean(value)).strip() or "Unknown"
+
+def is_cancelled_order(row):
+    return "cancel" in report_norm(row[ORDER_STATUS_IDX] if len(row) > ORDER_STATUS_IDX else "")
+
+def parse_report_period(title):
+    text = report_clean(title)
+    text = text.replace("Nu Life Essentials Rep ", "")
+    text = text.replace("Nu Life Essentials ", "")
+    text = text.replace("Nu Life ", "")
+    return text or "Commission Runs"
+
+def clean_folder_name(title):
+    text = report_clean(title)
+    text = text.replace("Nu Life Essentials Rep ", "Nu Life ")
+    text = text.replace("Nu Life Essentials ", "Nu Life ")
+    if "Commission" not in text:
+        text = "Nu Life Commission Runs"
+    return text
+
+def get_drive_service():
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=scopes
+    )
+    return build("drive", "v3", credentials=creds)
+
+def create_drive_folder(service, name, parent_id):
+    metadata = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    if parent_id:
+        metadata["parents"] = [parent_id]
+    folder = service.files().create(body=metadata, fields="id, webViewLink").execute()
+    return folder["id"], folder.get("webViewLink", "")
+
+def upload_file_to_drive(service, local_path, folder_id, drive_name=None):
+    drive_name = drive_name or os.path.basename(local_path)
+    metadata = {"name": drive_name, "parents": [folder_id]}
+    media = MediaFileUpload(local_path, resumable=False)
+    uploaded = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, webViewLink"
+    ).execute()
+    return uploaded
+
+def keep_cols_for_level(headers, level):
+    drop = {TRUE_COST_IDX}
+    for lvl in range(1, level):
+        start = COMMISSION_LEVELS[lvl]["name"]
+        drop.update([start, start + 1, start + 2])
+    return [i for i in range(len(headers)) if i not in drop]
+
+def apply_widths(ws):
+    for col in range(1, ws.max_column + 1):
+        letter = get_column_letter(col)
+        max_len = max(len(str(cell.value or "")) for cell in ws[letter])
+        ws.column_dimensions[letter].width = min(max_len + 3, 45)
+
+def write_report_sheet(ws, rep_name, level, rows, headers, period):
+    blue = PatternFill("solid", fgColor="1F4E78")
+    light = PatternFill("solid", fgColor="D9EAF7")
+    red = PatternFill("solid", fgColor="FFC7CE")
+
+    keep = keep_cols_for_level(headers, level)
+    kept_headers = [headers[i] for i in keep]
+    generated_comm_col = 23  # W after upper rep columns are removed
+
+    ws["A1"] = f"{rep_name} {period}"
+    ws["A1"].font = Font(size=16, bold=True, color="000000")
+    ws["A1"].alignment = Alignment(horizontal="left")
+
+    for c, h in enumerate(kept_headers, 1):
+        cell = ws.cell(2, c, h)
+        cell.fill = blue
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+
+    prepared = []
+    for r in rows:
+        r = r + [""] * (len(headers) - len(r))
+        prepared.append([r[i] for i in keep])
+
+    prepared.sort(key=lambda row: (
+        report_norm(row[17]) if len(row) > 17 else "",
+        report_norm(row[23]) if len(row) > 23 else "",
+        report_norm(row[4]) if len(row) > 4 else "",
+    ))
+
+    total_due = 0.0
+    cancelled_count = 0
+
+    for rr, row in enumerate(prepared, 3):
+        for cc, val in enumerate(row, 1):
+            ws.cell(rr, cc, val)
+
+        if "cancel" in report_norm(ws.cell(rr, 18).value):
+            cancelled_count += 1
+            for cc in range(1, len(kept_headers) + 1):
+                ws.cell(rr, cc).fill = red
+                ws.cell(rr, cc).font = Font(color="000000")
+            ws.cell(rr, generated_comm_col).value = 0
+            payout = 0.0
+        else:
+            payout = report_money(ws.cell(rr, generated_comm_col).value)
+
+        total_due += payout
+
+    last_data = ws.max_row
+    due_row = last_data + 3
+    ws[f"F{due_row}"] = "Due"
+    ws[f"G{due_row}"] = round(total_due, 2)
+    ws[f"F{due_row}"].font = Font(bold=True)
+    ws[f"G{due_row}"].font = Font(bold=True)
+    ws[f"F{due_row}"].fill = light
+    ws[f"G{due_row}"].fill = light
+    ws[f"G{due_row}"].number_format = "$#,##0.00"
+
+    for col in ["L", "M", "N", "O", "P", "W", "Z", "AC", "AF"]:
+        try:
+            for cell in ws[col][2:last_data]:
+                cell.number_format = "$#,##0.00"
+        except Exception:
+            pass
+
+    ws.freeze_panes = "A3"
+    apply_widths(ws)
+    return total_due, cancelled_count, len(prepared)
+
+def make_cleaned_raw_workbook(title, headers, data):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cleaned Raw Report"
+    blue = PatternFill("solid", fgColor="1F4E78")
+    red = PatternFill("solid", fgColor="FFC7CE")
+
+    ws["A1"] = title
+    ws["A1"].font = Font(size=16, bold=True, color="000000")
+    ws["A1"].alignment = Alignment(horizontal="left")
+
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(2, c, h)
+        cell.fill = blue
+        cell.font = Font(bold=True, color="FFFFFF")
+
+    commission_cols = [
+        COMMISSION_LEVELS[1]["comm"],
+        COMMISSION_LEVELS[2]["comm"],
+        COMMISSION_LEVELS[3]["comm"],
+        COMMISSION_LEVELS[4]["comm"],
+    ]
+
+    for rr, row in enumerate(data, 3):
+        row = row + [""] * (len(headers) - len(row))
+        cancelled = is_cancelled_order(row)
+        for cc, val in enumerate(row, 1):
+            raw_idx = cc - 1
+            if cancelled and raw_idx in commission_cols:
+                val = 0
+            cell = ws.cell(rr, cc, val)
+            if cancelled:
+                cell.fill = red
+                cell.font = Font(color="000000")
+
+    ws.freeze_panes = "A3"
+    apply_widths(ws)
+    return wb
+
+def calculate_alex_override(data):
+    # Alex override: 1.5% of subtotal revenue that is NOT Dean-only direct and NOT Alex/downline business.
+    qualifying_revenue = 0.0
+    detail_rows = []
+
+    for row in data:
+        row = row + [""] * 60
+        if is_cancelled_order(row):
+            continue
+
+        rep1 = report_norm(row[COMMISSION_LEVELS[1]["name"]])
+        rep2 = report_norm(row[COMMISSION_LEVELS[2]["name"]])
+        rep3 = report_norm(row[COMMISSION_LEVELS[3]["name"]])
+        rep4 = report_norm(row[COMMISSION_LEVELS[4]["name"]])
+
+        dean_direct = rep1 == "dean baker" and not rep2 and not rep3 and not rep4
+        alex_business = "alex bethel" in [rep1, rep2, rep3, rep4]
+
+        if dean_direct or alex_business:
+            continue
+
+        qualifying_revenue += report_money(row[SUBTOTAL_IDX])
+        detail_rows.append(row)
+
+    return qualifying_revenue, round(qualifying_revenue * 0.015, 2), detail_rows
+
+def add_alex_summary(wb, regular_due, override_revenue, override_due):
+    ws = wb.create_sheet("Alex Total Summary", 0)
+    ws["A1"] = "Alex Bethel Total Pay Summary"
+    ws["A1"].font = Font(size=16, bold=True)
+    rows = [
+        ("Regular Commission Due", regular_due),
+        ("1.5% Override Qualifying Revenue", override_revenue),
+        ("1.5% Override Due", override_due),
+        ("Total Due", regular_due + override_due),
+    ]
+    for i, (label, value) in enumerate(rows, 3):
+        ws[f"A{i}"] = label
+        ws[f"B{i}"] = round(value, 2)
+        ws[f"A{i}"].font = Font(bold=True)
+        ws[f"B{i}"].number_format = "$#,##0.00"
+    ws["A6"].fill = PatternFill("solid", fgColor="D9EAF7")
+    ws["B6"].fill = PatternFill("solid", fgColor="D9EAF7")
+    ws["B6"].font = Font(bold=True)
+    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["B"].width = 18
+
+def add_override_detail_sheet(wb, sheet_name, title, headers, rows, rate, subtotal_idx=SUBTOTAL_IDX):
+    ws = wb.create_sheet(sheet_name)
+    blue = PatternFill("solid", fgColor="1F4E78")
+    light = PatternFill("solid", fgColor="D9EAF7")
+    red = PatternFill("solid", fgColor="FFC7CE")
+
+    keep = [i for i in range(len(headers)) if i != TRUE_COST_IDX]
+    ws["A1"] = title
+    ws["A1"].font = Font(size=16, bold=True)
+    ws["A1"].alignment = Alignment(horizontal="left")
+
+    for c, h in enumerate([headers[i] for i in keep], 1):
+        cell = ws.cell(2, c, h)
+        cell.fill = blue
+        cell.font = Font(bold=True, color="FFFFFF")
+
+    qualifying_revenue = 0.0
+    for rr, row in enumerate(rows, 3):
+        row = row + [""] * (len(headers) - len(row))
+        cancelled = is_cancelled_order(row)
+        if not cancelled:
+            qualifying_revenue += report_money(row[subtotal_idx])
+        for cc, idx in enumerate(keep, 1):
+            val = row[idx]
+            cell = ws.cell(rr, cc, val)
+            if cancelled:
+                cell.fill = red
+                cell.font = Font(color="000000")
+
+    last_data = ws.max_row
+    summary = last_data + 3
+    due = round(qualifying_revenue * rate, 2)
+    ws[f"F{summary}"] = "Qualifying Revenue"
+    ws[f"G{summary}"] = round(qualifying_revenue, 2)
+    ws[f"F{summary+1}"] = "Override %"
+    ws[f"G{summary+1}"] = rate
+    ws[f"F{summary+2}"] = "Due"
+    ws[f"G{summary+2}"] = due
+
+    for r in range(summary, summary + 3):
+        ws[f"F{r}"].font = Font(bold=True)
+        ws[f"G{r}"].font = Font(bold=True)
+        ws[f"F{r}"].fill = light
+        ws[f"G{r}"].fill = light
+
+    ws[f"G{summary}"].number_format = "$#,##0.00"
+    ws[f"G{summary+1}"].number_format = "0.00%"
+    ws[f"G{summary+2}"].number_format = "$#,##0.00"
+    ws.freeze_panes = "A3"
+    apply_widths(ws)
+    return qualifying_revenue, due
+
+def build_commission_package(uploaded_file, reps_df, send_live=False, test_email=""):
+    temp_root = tempfile.mkdtemp(prefix="nulife_reports_")
+    source_path = os.path.join(temp_root, uploaded_file.name)
+    with open(source_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    with open(source_path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+
+    title = rows[0][0] if rows and rows[0] else "Nu Life Commission Runs"
+    headers = rows[1]
+    data = rows[2:]
+    period = parse_report_period(title)
+    folder_name = clean_folder_name(title)
+
+    package_dir = os.path.join(temp_root, folder_name)
+    rep_dir = os.path.join(package_dir, "Rep Reports")
+    os.makedirs(rep_dir, exist_ok=True)
+
+    shutil.copyfile(source_path, os.path.join(package_dir, uploaded_file.name))
+
+    cleaned_wb = make_cleaned_raw_workbook(title, headers, data)
+    cleaned_path = os.path.join(package_dir, "Nu Life Cleaned Raw Commission Report.xlsx")
+    cleaned_wb.save(cleaned_path)
+
+    rep_level_rows = defaultdict(lambda: defaultdict(list))
+    for row in data:
+        row = row + [""] * (len(headers) - len(row))
+        for level, idxs in COMMISSION_LEVELS.items():
+            rep_name = report_clean(row[idxs["name"]])
+            if rep_name:
+                rep_level_rows[rep_name][level].append(row)
+
+    alex_override_revenue, alex_override_due, alex_override_rows = calculate_alex_override(data)
+
+    pay_entries = []
+    delivery_rows = []
+
+    for rep_name in sorted(rep_level_rows.keys(), key=lambda x: x.lower()):
+        wb = Workbook()
+        wb.remove(wb.active)
+        regular_due = 0.0
+        row_count = 0
+        cancelled_count = 0
+
+        for level in sorted(rep_level_rows[rep_name].keys()):
+            sheet_name = "Commission Report" if len(rep_level_rows[rep_name]) == 1 else f"Level {level} Report"
+            ws = wb.create_sheet(sheet_name)
+            due, cancelled, count = write_report_sheet(ws, rep_name, level, rep_level_rows[rep_name][level], headers, period)
+            regular_due += due
+            cancelled_count += cancelled
+            row_count += count
+
+        override_due = 0.0
+        override_note = ""
+
+        if report_norm(rep_name) == "alex bethel":
+            override_due = alex_override_due
+            override_note = "Includes 1.5% override"
+            add_alex_summary(wb, regular_due, alex_override_revenue, alex_override_due)
+            add_override_detail_sheet(
+                wb,
+                "Alex 1.5 Override Detail",
+                f"Alex 1.5% Override {period}",
+                headers,
+                alex_override_rows,
+                0.015
+            )
+
+        total_due = regular_due + override_due
+
+        file_name = f"{safe_filename(rep_name)} {period}.xlsx"
+        file_path = os.path.join(rep_dir, file_name)
+        wb.save(file_path)
+
+        pay_entries.append({
+            "Rep Name": rep_name,
+            "Regular Commission": round(regular_due, 2),
+            "Override": round(override_due, 2),
+            "Total Due": round(total_due, 2),
+            "Notes": override_note,
+            "Report File": file_name,
+            "Rows": row_count,
+            "Cancelled": cancelled_count,
+            "Path": file_path,
+        })
+
+    # Joel override from Nelson
+    nelson_rows = []
+    for row in data:
+        row = row + [""] * (len(headers) - len(row))
+        if any("nelson" in report_norm(row[COMMISSION_LEVELS[level]["name"]]) for level in COMMISSION_LEVELS):
+            nelson_rows.append(row)
+
+    if nelson_rows:
+        wb = Workbook()
+        wb.remove(wb.active)
+        q_rev, due = add_override_detail_sheet(
+            wb,
+            "Joel Override Report",
+            f"Joel 2.5% Nelson Override {period}",
+            headers,
+            nelson_rows,
+            JOEL_NELSON_RATE
+        )
+        file_name = f"Joel Override {period}.xlsx"
+        file_path = os.path.join(rep_dir, file_name)
+        wb.save(file_path)
+        pay_entries.append({
+            "Rep Name": "Joel",
+            "Regular Commission": 0,
+            "Override": round(due, 2),
+            "Total Due": round(due, 2),
+            "Notes": "2.5% of Nelson qualifying subtotal revenue",
+            "Report File": file_name,
+            "Rows": len(nelson_rows),
+            "Cancelled": sum(1 for r in nelson_rows if is_cancelled_order(r)),
+            "Path": file_path,
+        })
+
+    # Howard finder fee
+    howard_rows = []
+    for row in data:
+        row = row + [""] * (len(headers) - len(row))
+        email = report_norm(row[CUSTOMER_EMAIL_IDX])
+        if email in HOWARD_CLIENT_EMAILS:
+            howard_rows.append(row)
+
+    if howard_rows:
+        wb = Workbook()
+        wb.remove(wb.active)
+        q_rev, due = add_override_detail_sheet(
+            wb,
+            "Howard Finder Fee",
+            f"Howard 5% Finder Fee {period}",
+            headers,
+            howard_rows,
+            HOWARD_FINDER_RATE
+        )
+        file_name = f"Howard Finder Fee {period}.xlsx"
+        file_path = os.path.join(rep_dir, file_name)
+        wb.save(file_path)
+        pay_entries.append({
+            "Rep Name": "Howard",
+            "Regular Commission": 0,
+            "Override": round(due, 2),
+            "Total Due": round(due, 2),
+            "Notes": "5% finder fee from assigned client emails",
+            "Report File": file_name,
+            "Rows": len(howard_rows),
+            "Cancelled": sum(1 for r in howard_rows if is_cancelled_order(r)),
+            "Path": file_path,
+        })
+
+    # Master pay report
+    pay_wb = Workbook()
+    pay_ws = pay_wb.active
+    pay_ws.title = "Master Pay Report"
+    pay_ws["A1"] = f"Nu Life Commission Pay Report - {period}"
+    pay_ws["A1"].font = Font(size=16, bold=True)
+    pay_headers = ["Rep Name", "Regular Commission", "Override", "Total Due", "Notes", "Report File"]
+    blue = PatternFill("solid", fgColor="1F4E78")
+    light = PatternFill("solid", fgColor="D9EAF7")
+
+    for c, h in enumerate(pay_headers, 1):
+        cell = pay_ws.cell(3, c, h)
+        cell.fill = blue
+        cell.font = Font(bold=True, color="FFFFFF")
+
+    for rr, entry in enumerate(sorted(pay_entries, key=lambda x: x["Rep Name"].lower()), 4):
+        for cc, key in enumerate(pay_headers, 1):
+            pay_ws.cell(rr, cc, entry.get(key, ""))
+
+    last_row = len(pay_entries) + 3
+    total_row = last_row + 2
+    pay_ws[f"C{total_row}"] = "Total Pay Due"
+    pay_ws[f"D{total_row}"] = f"=SUM(D4:D{last_row})"
+    pay_ws[f"C{total_row}"].font = Font(bold=True)
+    pay_ws[f"D{total_row}"].font = Font(bold=True)
+    pay_ws[f"C{total_row}"].fill = light
+    pay_ws[f"D{total_row}"].fill = light
+
+    for col in ["B", "C", "D"]:
+        for cell in pay_ws[col][3:total_row]:
+            cell.number_format = "$#,##0.00"
+
+    apply_widths(pay_ws)
+    master_pay_path = os.path.join(package_dir, "Nu Life Master Pay Report.xlsx")
+    pay_wb.save(master_pay_path)
+
+    # Master all-in-one workbook
+    master_wb = Workbook()
+    master_wb.remove(master_wb.active)
+
+    for source_file in [master_pay_path] + [e["Path"] for e in pay_entries]:
+        src_wb = load_workbook(source_file, data_only=False)
+        for sheet_name in src_wb.sheetnames:
+            src_ws = src_wb[sheet_name]
+            base_name = sheet_name if source_file == master_pay_path else f"{os.path.basename(source_file)[:15]} {sheet_name[:12]}"
+            dest_name = re.sub(r'[:\\/*?\[\]]', '', base_name)[:31]
+            original = dest_name
+            counter = 1
+            while dest_name in master_wb.sheetnames:
+                suffix = f" {counter}"
+                dest_name = (original[:31-len(suffix)] + suffix)
+                counter += 1
+            dst_ws = master_wb.create_sheet(dest_name)
+            for row in src_ws.iter_rows():
+                for cell in row:
+                    new_cell = dst_ws.cell(cell.row, cell.column, cell.value)
+                    if cell.has_style:
+                        new_cell._style = cell._style.copy()
+                    new_cell.number_format = cell.number_format
+                    new_cell.alignment = cell.alignment.copy()
+            for col_key, dim in src_ws.column_dimensions.items():
+                dst_ws.column_dimensions[col_key].width = dim.width
+            dst_ws.freeze_panes = src_ws.freeze_panes
+
+    master_all_path = os.path.join(package_dir, f"Nu Life Essentials {period}.xlsx")
+    master_wb.save(master_all_path)
+
+    # Email readiness lookup
+    def lookup_email(rep_name):
+        match = reps_df[
+            reps_df["FullName"].astype(str).str.strip().str.lower()
+            == report_norm(rep_name)
+        ]
+        if match.empty:
+            return "", "", "", "Rep not found"
+
+        row = match.iloc[0]
+        nulife_email = report_clean(row.get("NuLifeEmail", ""))
+        personal_email = report_clean(row.get("PersonalEmail", ""))
+
+        if nulife_email:
+            return nulife_email, nulife_email, personal_email, "Ready - NuLifeEmail"
+        if personal_email:
+            return personal_email, nulife_email, personal_email, "Ready - PersonalEmail"
+        return "", nulife_email, personal_email, "Missing email"
+
+    for entry in sorted(pay_entries, key=lambda x: x["Rep Name"].lower()):
+        send_to, nulife_email, personal_email, status = lookup_email(entry["Rep Name"])
+        delivery_rows.append({
+            "Rep Name": entry["Rep Name"],
+            "NuLifeEmail": nulife_email,
+            "PersonalEmail": personal_email,
+            "Send To": send_to,
+            "Status": status,
+            "Report File": entry["Report File"],
+            "Path": entry["Path"],
+        })
+
+    delivery_df = pd.DataFrame(delivery_rows)
+    delivery_csv_path = os.path.join(package_dir, "email_delivery_readiness.csv")
+    delivery_df.drop(columns=["Path"]).to_csv(delivery_csv_path, index=False)
+
+    # Zip package
+    zip_path = os.path.join(temp_root, f"{safe_filename(folder_name)}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(package_dir):
+            for file in files:
+                local_path = os.path.join(root, file)
+                arcname = os.path.relpath(local_path, temp_root)
+                z.write(local_path, arcname)
+
+    # Upload to Drive
+    drive_folder_link = ""
+    drive_files_uploaded = []
+    if REPORTS_PARENT_FOLDER_ID:
+        service = get_drive_service()
+        folder_id, drive_folder_link = create_drive_folder(service, folder_name, REPORTS_PARENT_FOLDER_ID)
+        rep_folder_id, _ = create_drive_folder(service, "Rep Reports", folder_id)
+
+        for file in os.listdir(package_dir):
+            p = os.path.join(package_dir, file)
+            if os.path.isfile(p):
+                uploaded = upload_file_to_drive(service, p, folder_id)
+                drive_files_uploaded.append(uploaded.get("webViewLink", ""))
+
+        for file in os.listdir(rep_dir):
+            p = os.path.join(rep_dir, file)
+            uploaded = upload_file_to_drive(service, p, rep_folder_id)
+            drive_files_uploaded.append(uploaded.get("webViewLink", ""))
+
+    # Email send or test preview
+    email_log = []
+    if send_live:
+        if not SENDER_EMAIL or not SENDER_APP_PASSWORD:
+            raise RuntimeError("Missing SENDER_EMAIL or SENDER_APP_PASSWORD in Streamlit secrets.")
+
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
+
+        for item in delivery_rows:
+            if not item["Send To"]:
+                email_log.append({**item, "Email Status": "SKIPPED - Missing email"})
+                continue
+
+            to_email = test_email.strip() if test_email.strip() else item["Send To"]
+
+            msg = EmailMessage()
+            msg["Subject"] = folder_name
+            msg["From"] = SENDER_EMAIL
+            msg["To"] = to_email
+            msg.set_content(
+                f"Hello {item['Rep Name']},\n\n"
+                f"Attached is your Nu Life commission report for this period.\n\n"
+                f"Please review your report carefully.\n\n"
+                f"Thank you,\nNu Life Essentials\n"
+            )
+
+            with open(item["Path"], "rb") as f:
+                msg.add_attachment(
+                    f.read(),
+                    maintype="application",
+                    subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    filename=item["Report File"]
+                )
+
+            server.send_message(msg)
+            email_log.append({**item, "Email Status": f"SENT to {to_email}"})
+
+        server.quit()
+    else:
+        for item in delivery_rows:
+            if not item["Send To"]:
+                email_log.append({**item, "Email Status": "TEST - Missing email"})
+            else:
+                email_log.append({**item, "Email Status": f"TEST - Would send to {item['Send To']}"})
+
+    email_log_df = pd.DataFrame(email_log).drop(columns=["Path"])
+    email_log_path = os.path.join(package_dir, "email_delivery_log.xlsx")
+    email_log_df.to_excel(email_log_path, index=False)
+
+    return {
+        "folder_name": folder_name,
+        "zip_path": zip_path,
+        "package_dir": package_dir,
+        "drive_folder_link": drive_folder_link,
+        "pay_entries": pd.DataFrame(pay_entries).drop(columns=["Path"]),
+        "delivery_df": delivery_df.drop(columns=["Path"]),
+        "email_log_df": email_log_df,
+        "reports_count": len(pay_entries),
+    }
+
+def render_reporting_page(reps_df):
+    st.title("Reporting")
+    st.caption("Upload Nu Life commission CSV, generate reports, save to Drive, and email reps.")
+
+    missing = []
+    for key in ["REPORTS_PARENT_FOLDER_ID", "SENDER_EMAIL", "SENDER_APP_PASSWORD"]:
+        if not st.secrets.get(key, ""):
+            missing.append(key)
+
+    if missing:
+        st.warning("Missing Streamlit secrets: " + ", ".join(missing))
+
+    uploaded = st.file_uploader("Upload raw Nu Life commission CSV", type=["csv"])
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        test_mode = st.checkbox("TEST MODE - do not send live emails", value=True)
+    with c2:
+        test_email = st.text_input("Optional test email override")
+    with c3:
+        confirm_live = st.text_input("Type SEND to allow live email", value="")
+
+    st.info("Email priority: NuLifeEmail first. If blank, PersonalEmail. If both blank, report is flagged and skipped.")
+
+    if uploaded:
+        st.success(f"Loaded file: {uploaded.name}")
+
+    if st.button("Generate Reports", type="primary", use_container_width=True, disabled=uploaded is None):
+        send_live = (not test_mode) and confirm_live.strip().upper() == "SEND"
+
+        if not test_mode and confirm_live.strip().upper() != "SEND":
+            st.error("Live mode requires typing SEND.")
+            st.stop()
+
+        with st.spinner("Generating reports..."):
+            result = build_commission_package(
+                uploaded,
+                reps_df,
+                send_live=send_live,
+                test_email=test_email
+            )
+
+        st.success(f"Generated {result['reports_count']} report(s).")
+
+        if result["drive_folder_link"]:
+            st.markdown(f"**Drive folder:** {result['drive_folder_link']}")
+
+        st.subheader("Master Pay Preview")
+        st.dataframe(result["pay_entries"], use_container_width=True)
+
+        st.subheader("Email Delivery Preview / Log")
+        st.dataframe(result["email_log_df"], use_container_width=True)
+
+        with open(result["zip_path"], "rb") as f:
+            st.download_button(
+                "Download Full Report Package ZIP",
+                data=f,
+                file_name=os.path.basename(result["zip_path"]),
+                mime="application/zip",
+                use_container_width=True
+            )
+
+
 def login():
     st.title("NuLife Rep Locator")
     st.caption("Secure access required")
@@ -302,7 +1044,7 @@ st.sidebar.title("NuLife Rep Locator")
 
 page = st.sidebar.radio(
     "Navigation",
-    ["Dashboard", "Map", "Rep Directory", "Sales Dashboard", "Manage Reps"]
+    ["Dashboard", "Map", "Rep Directory", "Sales Dashboard", "Reporting", "Manage Reps"]
 )
 
 if st.sidebar.button("Log out"):
@@ -537,6 +1279,9 @@ elif page == "Sales Dashboard":
     st.markdown("---")
     st.subheader("Raw Sales Data")
     st.dataframe(sales_df, use_container_width=True)
+
+elif page == "Reporting":
+    render_reporting_page(reps_df)
 
 elif page == "Manage Reps":
     st.title("Manage Reps")
