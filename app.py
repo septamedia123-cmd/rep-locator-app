@@ -7,6 +7,7 @@ from streamlit_folium import st_folium
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 from copy import copy
+from difflib import SequenceMatcher
 
 import io
 import csv
@@ -320,6 +321,52 @@ def report_clean(value):
 
 def report_norm(value):
     return report_clean(value).lower()
+
+def normalize_name(value):
+    """
+    Strong name normalizer for matching commission report names to rep_profiles.
+    Handles case, extra spaces, punctuation, middle initials, suffixes, apostrophes,
+    and common first-name variants.
+    """
+    value = report_clean(value).lower()
+    value = value.replace("&", " and ")
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+
+    suffixes = {"jr", "sr", "ii", "iii", "iv", "md", "do", "phd"}
+    parts = [p for p in value.split() if p not in suffixes]
+
+    nickname_map = {
+        "steven": "steve",
+        "stephen": "steve",
+        "matthew": "matt",
+        "michael": "mike",
+        "robert": "bob",
+        "william": "bill",
+        "andrew": "andrew",
+        "andrrew": "andrew",
+        "rebecca": "becca",
+        "timothy": "tim",
+        "ronald": "ron",
+        "christopher": "chris",
+        "joseph": "joe",
+        "daniel": "dan",
+        "david": "dave",
+        "james": "jim",
+        "kenneth": "ken",
+    }
+
+    if parts:
+        parts[0] = nickname_map.get(parts[0], parts[0])
+
+    return " ".join(parts)
+
+def name_tokens(value):
+    normalized = normalize_name(value)
+    return [p for p in normalized.split() if p]
+
+def name_similarity(a, b):
+    return SequenceMatcher(None, normalize_name(a), normalize_name(b)).ratio()
 
 def report_money(value):
     s = report_clean(value).replace("$", "").replace(",", "").replace(" ", "")
@@ -829,46 +876,104 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
 
     # Email readiness lookup
     def lookup_email(rep_name):
-        rep_name_clean = report_norm(rep_name)
+        """
+        Iron-clad matching order:
+        1. Exact normalized FullName
+        2. First + Last token match
+        3. Last name + first initial
+        4. Last name only when unique
+        5. Fuzzy match above 0.86 when unique
+        """
+
+        rep_name_clean = normalize_name(rep_name)
+        rep_parts = name_tokens(rep_name)
+        rep_first = rep_parts[0] if rep_parts else ""
+        rep_last = rep_parts[-1] if rep_parts else ""
 
         profiles = reps_df.copy()
 
-        profiles["FullName_clean"] = (
-            profiles["FullName"]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-        )
+        for required_col in ["FullName", "FirstName", "LastName", "NuLifeEmail", "PersonalEmail"]:
+            if required_col not in profiles.columns:
+                profiles[required_col] = ""
 
-        profiles["FirstName_clean"] = (
-            profiles["FirstName"]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-        )
+        profiles["FullName_clean"] = profiles["FullName"].apply(normalize_name)
+        profiles["FirstName_clean"] = profiles["FirstName"].apply(normalize_name)
+        profiles["LastName_clean"] = profiles["LastName"].apply(normalize_name)
 
-        profiles["LastName_clean"] = (
-            profiles["LastName"]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-        )
+        # Build a clean name from FirstName + LastName too, because FullName can be missing/stale.
+        profiles["BuiltName_clean"] = (
+            profiles["FirstName_clean"].astype(str).str.strip()
+            + " "
+            + profiles["LastName_clean"].astype(str).str.strip()
+        ).str.strip()
 
-        # 1. Exact FullName match
-        match = profiles[profiles["FullName_clean"] == rep_name_clean]
+        match = profiles[
+            (profiles["FullName_clean"] == rep_name_clean)
+            | (profiles["BuiltName_clean"] == rep_name_clean)
+        ]
 
-        # 2. Last-name fallback for name differences like Steve vs Steven
+        match_method = "Exact name match"
+
+        # First + last token match
+        if match.empty and rep_first and rep_last:
+            match = profiles[
+                (profiles["FirstName_clean"] == rep_first)
+                & (profiles["LastName_clean"] == rep_last)
+            ]
+            match_method = "First/last match"
+
+        # Last name + first initial match
+        if match.empty and rep_first and rep_last:
+            match = profiles[
+                (profiles["LastName_clean"] == rep_last)
+                & (
+                    profiles["FirstName_clean"]
+                    .astype(str)
+                    .str.startswith(rep_first[:1])
+                )
+            ]
+            match_method = "Last name + first initial match"
+
+        # Last name only, only if unique
+        if match.empty and rep_last:
+            last_matches = profiles[profiles["LastName_clean"] == rep_last]
+            if len(last_matches) == 1:
+                match = last_matches
+                match_method = "Unique last-name match"
+
+        # Fuzzy match as final fallback
         if match.empty:
-            parts = rep_name_clean.split()
-            if len(parts) >= 2:
-                last_name = parts[-1]
-                match = profiles[profiles["LastName_clean"] == last_name]
+            candidates = []
+            for idx, row in profiles.iterrows():
+                score_full = name_similarity(rep_name_clean, row.get("FullName_clean", ""))
+                score_built = name_similarity(rep_name_clean, row.get("BuiltName_clean", ""))
+                score = max(score_full, score_built)
+                if score >= 0.86:
+                    candidates.append((score, idx))
+
+            candidates = sorted(candidates, reverse=True)
+
+            if len(candidates) == 1:
+                match = profiles.loc[[candidates[0][1]]]
+                match_method = f"Fuzzy match {candidates[0][0]:.2f}"
+            elif len(candidates) > 1:
+                best_score = candidates[0][0]
+                close = [c for c in candidates if best_score - c[0] < 0.03]
+                if len(close) == 1:
+                    match = profiles.loc[[close[0][1]]]
+                    match_method = f"Fuzzy match {close[0][0]:.2f}"
+                else:
+                    possible = ", ".join(
+                        profiles.loc[idx, "FullName"] for _, idx in close[:5]
+                    )
+                    return "", "", "", f"Multiple possible reps - {possible}"
 
         if match.empty:
             return "", "", "", "Rep not found"
 
         if len(match) > 1:
-            return "", "", "", "Multiple possible reps - check name"
+            possible = ", ".join(match["FullName"].astype(str).head(5).tolist())
+            return "", "", "", f"Multiple possible reps - {possible}"
 
         row = match.iloc[0]
 
@@ -876,12 +981,12 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
         personal_email = report_clean(row.get("PersonalEmail", ""))
 
         if nulife_email:
-            return nulife_email, nulife_email, personal_email, "Ready - NuLifeEmail"
+            return nulife_email, nulife_email, personal_email, f"Ready - NuLifeEmail ({match_method})"
 
         if personal_email:
-            return personal_email, nulife_email, personal_email, "Ready - PersonalEmail"
+            return personal_email, nulife_email, personal_email, f"Ready - PersonalEmail ({match_method})"
 
-        return "", nulife_email, personal_email, "Missing email"
+        return "", nulife_email, personal_email, f"Missing email ({match_method})"
 
     for entry in sorted(pay_entries, key=lambda x: x["Rep Name"].lower()):
         send_to, nulife_email, personal_email, status = lookup_email(entry["Rep Name"])
