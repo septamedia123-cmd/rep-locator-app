@@ -23,7 +23,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="NuLife Rep Locator", page_icon="📍", layout="wide")
+st.set_page_config(page_title="Nu Life Admin App", page_icon="📍", layout="wide")
 
 # =========================
 # DARK PREMIUM APP STYLING
@@ -143,7 +143,7 @@ if os.path.exists("logo.png"):
     with col2:
         st.markdown("""
         <div style="font-size: 34px; font-weight: 900; color: white; padding-top: 10px;">
-            NuLife Rep Locator
+            Nu Life Admin App
         </div>
         <div style="font-size: 15px; color: #94a3b8; margin-top: 4px;">
             Sales territory mapping, rep profiles, and performance visibility
@@ -152,7 +152,7 @@ if os.path.exists("logo.png"):
 else:
     st.markdown("""
     <div style="font-size: 34px; font-weight: 900; color: white;">
-        NuLife Rep Locator
+        Nu Life Admin App
     </div>
     <div style="font-size: 15px; color: #94a3b8; margin-top: 4px;">
         Sales territory mapping, rep profiles, and performance visibility
@@ -829,41 +829,59 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
 
     # Email readiness lookup
     def lookup_email(rep_name):
-    rep_name_clean = report_norm(rep_name)
+        rep_name_clean = report_norm(rep_name)
 
-    profiles = reps_df.copy()
-    profiles["FullName_clean"] = profiles["FullName"].astype(str).str.strip().str.lower()
-    profiles["FirstName_clean"] = profiles["FirstName"].astype(str).str.strip().str.lower()
-    profiles["LastName_clean"] = profiles["LastName"].astype(str).str.strip().str.lower()
+        profiles = reps_df.copy()
 
-    # 1. Exact FullName match
-    match = profiles[profiles["FullName_clean"] == rep_name_clean]
+        profiles["FullName_clean"] = (
+            profiles["FullName"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
 
-    # 2. Last-name fallback
-    if match.empty:
-        parts = rep_name_clean.split()
-        if len(parts) >= 2:
-            last_name = parts[-1]
-            match = profiles[profiles["LastName_clean"] == last_name]
+        profiles["FirstName_clean"] = (
+            profiles["FirstName"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
 
-    if match.empty:
-        return "", "", "", "Rep not found"
+        profiles["LastName_clean"] = (
+            profiles["LastName"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
 
-    if len(match) > 1:
-        return "", "", "", "Multiple possible reps - check name"
+        # 1. Exact FullName match
+        match = profiles[profiles["FullName_clean"] == rep_name_clean]
 
-    row = match.iloc[0]
+        # 2. Last-name fallback for name differences like Steve vs Steven
+        if match.empty:
+            parts = rep_name_clean.split()
+            if len(parts) >= 2:
+                last_name = parts[-1]
+                match = profiles[profiles["LastName_clean"] == last_name]
 
-    nulife_email = report_clean(row.get("NuLifeEmail", ""))
-    personal_email = report_clean(row.get("PersonalEmail", ""))
+        if match.empty:
+            return "", "", "", "Rep not found"
 
-    if nulife_email:
-        return nulife_email, nulife_email, personal_email, "Ready - NuLifeEmail"
+        if len(match) > 1:
+            return "", "", "", "Multiple possible reps - check name"
 
-    if personal_email:
-        return personal_email, nulife_email, personal_email, "Ready - PersonalEmail"
+        row = match.iloc[0]
 
-    return "", nulife_email, personal_email, "Missing email"
+        nulife_email = report_clean(row.get("NuLifeEmail", ""))
+        personal_email = report_clean(row.get("PersonalEmail", ""))
+
+        if nulife_email:
+            return nulife_email, nulife_email, personal_email, "Ready - NuLifeEmail"
+
+        if personal_email:
+            return personal_email, nulife_email, personal_email, "Ready - PersonalEmail"
+
+        return "", nulife_email, personal_email, "Missing email"
 
     for entry in sorted(pay_entries, key=lambda x: x["Rep Name"].lower()):
         send_to, nulife_email, personal_email, status = lookup_email(entry["Rep Name"])
@@ -1035,7 +1053,7 @@ def render_reporting_page(reps_df):
 
 
 def login():
-    st.title("NuLife Rep Locator")
+    st.title("Nu Life Admin App")
     st.caption("Secure access required")
 
     pw = st.text_input("Password", type="password")
@@ -1060,7 +1078,7 @@ sales_df = clean_sales_df(load_sales())
 if os.path.exists("logo.png"):
     st.sidebar.image("logo.png", width=120)
 
-st.sidebar.title("NuLife Rep Locator")
+st.sidebar.title("Nu Life Admin App")
 
 page = st.sidebar.radio(
     "Navigation",
