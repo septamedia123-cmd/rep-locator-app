@@ -829,22 +829,41 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
 
     # Email readiness lookup
     def lookup_email(rep_name):
-        match = reps_df[
-            reps_df["FullName"].astype(str).str.strip().str.lower()
-            == report_norm(rep_name)
-        ]
-        if match.empty:
-            return "", "", "", "Rep not found"
+    rep_name_clean = report_norm(rep_name)
 
-        row = match.iloc[0]
-        nulife_email = report_clean(row.get("NuLifeEmail", ""))
-        personal_email = report_clean(row.get("PersonalEmail", ""))
+    profiles = reps_df.copy()
+    profiles["FullName_clean"] = profiles["FullName"].astype(str).str.strip().str.lower()
+    profiles["FirstName_clean"] = profiles["FirstName"].astype(str).str.strip().str.lower()
+    profiles["LastName_clean"] = profiles["LastName"].astype(str).str.strip().str.lower()
 
-        if nulife_email:
-            return nulife_email, nulife_email, personal_email, "Ready - NuLifeEmail"
-        if personal_email:
-            return personal_email, nulife_email, personal_email, "Ready - PersonalEmail"
-        return "", nulife_email, personal_email, "Missing email"
+    # 1. Exact FullName match
+    match = profiles[profiles["FullName_clean"] == rep_name_clean]
+
+    # 2. Last-name fallback
+    if match.empty:
+        parts = rep_name_clean.split()
+        if len(parts) >= 2:
+            last_name = parts[-1]
+            match = profiles[profiles["LastName_clean"] == last_name]
+
+    if match.empty:
+        return "", "", "", "Rep not found"
+
+    if len(match) > 1:
+        return "", "", "", "Multiple possible reps - check name"
+
+    row = match.iloc[0]
+
+    nulife_email = report_clean(row.get("NuLifeEmail", ""))
+    personal_email = report_clean(row.get("PersonalEmail", ""))
+
+    if nulife_email:
+        return nulife_email, nulife_email, personal_email, "Ready - NuLifeEmail"
+
+    if personal_email:
+        return personal_email, nulife_email, personal_email, "Ready - PersonalEmail"
+
+    return "", nulife_email, personal_email, "Missing email"
 
     for entry in sorted(pay_entries, key=lambda x: x["Rep Name"].lower()):
         send_to, nulife_email, personal_email, status = lookup_email(entry["Rep Name"])
