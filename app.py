@@ -178,6 +178,12 @@ SALES_HEADERS = [
     "Revenue", "Providers", "TopProduct", "LastOrderDate", "AverageOrderValue"
 ]
 
+SALES_HISTORY_HEADERS = [
+    "ReportPeriod", "Month", "RepName", "Orders", "Sales", "AverageOrder",
+    "TopProduct1", "TopProduct2", "TopProduct3", "CancelledOrders",
+    "TotalRows", "CancelledRate", "GeneratedAt"
+]
+
 def get_gsheet_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -227,6 +233,55 @@ def load_sales():
 
     except Exception:
         return pd.DataFrame(columns=SALES_HEADERS)
+
+def get_or_create_worksheet(sheet, worksheet_name, headers):
+    try:
+        ws = sheet.worksheet(worksheet_name)
+    except Exception:
+        ws = sheet.add_worksheet(title=worksheet_name, rows=1000, cols=max(len(headers), 10))
+        ws.update([headers])
+    return ws
+
+@st.cache_data(ttl=300)
+def load_sales_history():
+    try:
+        gc = get_gsheet_client()
+        sheet = gc.open_by_key(GSHEET_ID)
+        ws = get_or_create_worksheet(sheet, "rep_sales_history", SALES_HISTORY_HEADERS)
+        data = ws.get_all_records()
+        df = pd.DataFrame(data)
+
+        for col in SALES_HISTORY_HEADERS:
+            if col not in df.columns:
+                df[col] = ""
+
+        return df[SALES_HISTORY_HEADERS]
+
+    except Exception:
+        return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
+
+def save_sales_history(df):
+    try:
+        gc = get_gsheet_client()
+        sheet = gc.open_by_key(GSHEET_ID)
+        ws = get_or_create_worksheet(sheet, "rep_sales_history", SALES_HISTORY_HEADERS)
+
+        clean_df = df.copy()
+        for col in SALES_HISTORY_HEADERS:
+            if col not in clean_df.columns:
+                clean_df[col] = ""
+
+        clean_df = clean_df[SALES_HISTORY_HEADERS].fillna("")
+        ws.clear()
+        ws.update([SALES_HISTORY_HEADERS] + clean_df.astype(str).values.tolist())
+        st.cache_data.clear()
+        return True
+
+    except Exception as e:
+        st.error("Could not save rep_sales_history to Google Sheets.")
+        st.write("Error type:", type(e).__name__)
+        st.write("Error details:", str(e))
+        return False
 
 def save_reps(df):
     try:
@@ -698,41 +753,56 @@ def unique_non_cancelled_orders(rows, headers):
 
     return cleaned
 
-def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period):
+def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period, history_df=None):
     """
     Adds Monthly Summary, Product Summary, and Charts tabs to each rep workbook.
-
-    Metrics:
-    - Total Orders = count of non-cancelled unique orders
-    - Total Sales = sum of Sub Total column L
-    - Average Order = Total Sales / Total Orders
-    - Top Products = top 3 product names by order count
+    Charts include historical periods from rep_sales_history plus the current report run.
     """
     orders = unique_non_cancelled_orders(source_rows, headers)
-
+    total_source_rows = len(source_rows)
+    cancelled_orders = sum(1 for row in source_rows if is_cancelled_order(row))
     total_orders = len(orders)
     total_sales = sum(report_money(row[SUBTOTAL_IDX]) for row in orders)
     avg_order = total_sales / total_orders if total_orders else 0
 
     product_idx = find_product_column(headers)
     product_counts = defaultdict(int)
-
     if product_idx is not None:
         for row in orders:
             product = report_clean(row[product_idx] if product_idx < len(row) else "")
             if product:
                 product_counts[product] += 1
-
     top_products = sorted(product_counts.items(), key=lambda item: item[1], reverse=True)[:3]
 
     blue = PatternFill("solid", fgColor="1F4E78")
     light = PatternFill("solid", fgColor="D9EAF7")
+
+    current_history_row = create_sales_history_row(
+        rep_name,
+        period,
+        {
+            "orders": total_orders,
+            "sales": total_sales,
+            "average_order": avg_order,
+            "top_products": top_products,
+            "cancelled_orders": cancelled_orders,
+            "total_rows": total_source_rows,
+        },
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+    rep_history = upsert_sales_history(normalize_history_df(history_df), [current_history_row])
+    rep_history = rep_history[rep_history["RepName"].astype(str).str.lower() == report_norm(rep_name)].copy()
+    rep_history["_sort"] = rep_history["ReportPeriod"].apply(period_sort_key)
+    rep_history = rep_history.sort_values("_sort").drop(columns=["_sort"])
 
     # Monthly Summary
     ws = wb.create_sheet("Monthly Summary")
     ws["A1"] = f"{rep_name} Sales Summary"
     ws["A1"].font = Font(size=16, bold=True)
     ws["A1"].alignment = Alignment(horizontal="left")
+    for cell in ws["A1:G1"][0]:
+        cell.fill = light
 
     summary_headers = ["Period", "Total Orders", "Total Sales", "Average Order"]
     for c, h in enumerate(summary_headers, 1):
@@ -741,50 +811,45 @@ def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period):
         cell.font = Font(bold=True, color="FFFFFF")
         cell.alignment = Alignment(horizontal="center")
 
-    ws["A4"] = period
-    ws["B4"] = total_orders
-    ws["C4"] = round(total_sales, 2)
-    ws["D4"] = round(avg_order, 2)
-    ws["C4"].number_format = "$#,##0.00"
-    ws["D4"].number_format = "$#,##0.00"
+    for r_idx, (_, hist_row) in enumerate(rep_history.iterrows(), 4):
+        ws.cell(r_idx, 1, hist_row["Month"] or hist_row["ReportPeriod"])
+        ws.cell(r_idx, 2, int(hist_row["Orders"]))
+        ws.cell(r_idx, 3, round(float(hist_row["Sales"]), 2))
+        ws.cell(r_idx, 4, round(float(hist_row["AverageOrder"]), 2))
+        ws.cell(r_idx, 3).number_format = "$#,##0.00"
+        ws.cell(r_idx, 4).number_format = "$#,##0.00"
 
     ws["F3"] = "Metric"
-    ws["G3"] = "Value"
+    ws["G3"] = "Current Value"
     ws["F3"].fill = blue
     ws["G3"].fill = blue
     ws["F3"].font = Font(bold=True, color="FFFFFF")
     ws["G3"].font = Font(bold=True, color="FFFFFF")
-
     metrics = [
-        ("Total Orders", total_orders),
-        ("Total Sales", round(total_sales, 2)),
-        ("Average Order", round(avg_order, 2)),
+        ("Current Orders", total_orders),
+        ("Current Sales", round(total_sales, 2)),
+        ("Current Average Order", round(avg_order, 2)),
+        ("Cancelled Order %", (cancelled_orders / total_source_rows) if total_source_rows else 0),
     ]
-
     for r, (metric, value) in enumerate(metrics, 4):
         ws[f"F{r}"] = metric
         ws[f"G{r}"] = value
         ws[f"F{r}"].font = Font(bold=True)
-        if metric != "Total Orders":
+        if "Order %" in metric:
+            ws[f"G{r}"].number_format = "0.00%"
+        elif metric != "Current Orders":
             ws[f"G{r}"].number_format = "$#,##0.00"
-
-    for cell in ws["A1:G1"][0]:
-        cell.fill = light
-
     apply_widths(ws)
 
     # Product Summary
     ps = wb.create_sheet("Product Summary")
     ps["A1"] = f"{rep_name} Top Products"
     ps["A1"].font = Font(size=16, bold=True)
-
-    ps_headers = ["Rank", "Product", "Orders"]
-    for c, h in enumerate(ps_headers, 1):
+    for c, h in enumerate(["Rank", "Product", "Orders"], 1):
         cell = ps.cell(3, c, h)
         cell.fill = blue
         cell.font = Font(bold=True, color="FFFFFF")
         cell.alignment = Alignment(horizontal="center")
-
     if top_products:
         for r, (product, count) in enumerate(top_products, 4):
             ps.cell(r, 1, r - 3)
@@ -794,7 +859,6 @@ def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period):
         ps["A4"] = "No product column detected"
         ps["B4"] = "Confirm portal export product column"
         ps["C4"] = 0
-
     apply_widths(ps)
 
     # Charts
@@ -806,12 +870,14 @@ def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period):
     charts["B3"] = "Total Orders"
     charts["C3"] = "Total Sales"
     charts["D3"] = "Average Order"
-    charts["A4"] = period
-    charts["B4"] = total_orders
-    charts["C4"] = round(total_sales, 2)
-    charts["D4"] = round(avg_order, 2)
-    charts["C4"].number_format = "$#,##0.00"
-    charts["D4"].number_format = "$#,##0.00"
+    for r_idx, (_, hist_row) in enumerate(rep_history.iterrows(), 4):
+        charts.cell(r_idx, 1, hist_row["Month"] or hist_row["ReportPeriod"])
+        charts.cell(r_idx, 2, int(hist_row["Orders"]))
+        charts.cell(r_idx, 3, round(float(hist_row["Sales"]), 2))
+        charts.cell(r_idx, 4, round(float(hist_row["AverageOrder"]), 2))
+        charts.cell(r_idx, 3).number_format = "$#,##0.00"
+        charts.cell(r_idx, 4).number_format = "$#,##0.00"
+    history_last_row = max(4, 3 + len(rep_history))
 
     charts["F3"] = "Product"
     charts["G3"] = "Orders"
@@ -828,31 +894,31 @@ def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period):
         cell.font = Font(bold=True, color="FFFFFF")
 
     orders_chart = BarChart()
-    orders_chart.title = "Total Orders for Period"
+    orders_chart.title = "Total Orders Over Time"
     orders_chart.y_axis.title = "Orders"
     orders_chart.x_axis.title = "Period"
-    orders_chart.add_data(Reference(charts, min_col=2, min_row=3, max_row=4), titles_from_data=True)
-    orders_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=4))
+    orders_chart.add_data(Reference(charts, min_col=2, min_row=3, max_row=history_last_row), titles_from_data=True)
+    orders_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=history_last_row))
     orders_chart.height = 8
     orders_chart.width = 14
     charts.add_chart(orders_chart, "A8")
 
     sales_chart = LineChart()
-    sales_chart.title = "Total Sales for Period ($)"
+    sales_chart.title = "Total Sales Over Time ($)"
     sales_chart.y_axis.title = "Sales"
     sales_chart.x_axis.title = "Period"
-    sales_chart.add_data(Reference(charts, min_col=3, min_row=3, max_row=4), titles_from_data=True)
-    sales_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=4))
+    sales_chart.add_data(Reference(charts, min_col=3, min_row=3, max_row=history_last_row), titles_from_data=True)
+    sales_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=history_last_row))
     sales_chart.height = 8
     sales_chart.width = 14
     charts.add_chart(sales_chart, "I8")
 
     avg_chart = BarChart()
-    avg_chart.title = "Average Order Amount"
+    avg_chart.title = "Average Order Amount Over Time"
     avg_chart.y_axis.title = "Average Order"
     avg_chart.x_axis.title = "Period"
-    avg_chart.add_data(Reference(charts, min_col=4, min_row=3, max_row=4), titles_from_data=True)
-    avg_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=4))
+    avg_chart.add_data(Reference(charts, min_col=4, min_row=3, max_row=history_last_row), titles_from_data=True)
+    avg_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=history_last_row))
     avg_chart.height = 8
     avg_chart.width = 14
     charts.add_chart(avg_chart, "A24")
@@ -867,7 +933,6 @@ def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period):
     product_chart.height = 8
     product_chart.width = 14
     charts.add_chart(product_chart, "I24")
-
     apply_widths(charts)
 
     return {
@@ -875,9 +940,11 @@ def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period):
         "sales": round(total_sales, 2),
         "average_order": round(avg_order, 2),
         "top_products": top_products,
+        "cancelled_orders": cancelled_orders,
+        "total_rows": total_source_rows,
     }
 
-def build_commission_package(uploaded_file, reps_df, send_live=False, test_email=""):
+def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send_live=False, test_email=""):
     temp_root = tempfile.mkdtemp(prefix="nulife_reports_")
     source_path = os.path.join(temp_root, uploaded_file.name)
     with open(source_path, "wb") as f:
@@ -914,6 +981,9 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
 
     pay_entries = []
     delivery_rows = []
+    history_update_rows = []
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sales_history_df = normalize_history_df(sales_history_df)
 
     for rep_name in sorted(rep_level_rows.keys(), key=lambda x: x.lower()):
         wb = Workbook()
@@ -959,7 +1029,12 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
             rep_name,
             all_rep_source_rows,
             headers,
-            period
+            period,
+            sales_history_df
+        )
+
+        history_update_rows.append(
+            create_sales_history_row(rep_name, period, sales_metrics, generated_at)
         )
 
         file_name = f"{safe_filename(rep_name)} {period}.xlsx"
@@ -1085,11 +1160,19 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
     master_pay_path = os.path.join(package_dir, "Nu Life Master Pay Report.xlsx")
     pay_wb.save(master_pay_path)
 
+    # Update permanent rep_sales_history tab and create analytics workbook.
+    updated_sales_history_df = upsert_sales_history(sales_history_df, history_update_rows)
+    save_sales_history(updated_sales_history_df)
+
+    analytics_wb = create_sales_analytics_workbook(updated_sales_history_df, period)
+    analytics_path = os.path.join(package_dir, "Nu Life Sales Analytics.xlsx")
+    analytics_wb.save(analytics_path)
+
     # Master all-in-one workbook
     master_wb = Workbook()
     master_wb.remove(master_wb.active)
 
-    for source_file in [master_pay_path] + [e["Path"] for e in pay_entries]:
+    for source_file in [master_pay_path, analytics_path] + [e["Path"] for e in pay_entries]:
         src_wb = load_workbook(source_file, data_only=False)
         for sheet_name in src_wb.sheetnames:
             src_ws = src_wb[sheet_name]
@@ -1334,6 +1417,7 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
         "delivery_df": delivery_df.drop(columns=["Path"]),
         "email_log_df": email_log_df,
         "reports_count": len(pay_entries),
+        "sales_history_df": updated_sales_history_df,
     }
 
 def render_reporting_page(reps_df):
@@ -1371,9 +1455,12 @@ def render_reporting_page(reps_df):
             st.stop()
 
         with st.spinner("Generating reports..."):
+            sales_history_df = load_sales_history()
+
             result = build_commission_package(
                 uploaded,
                 reps_df,
+                sales_history_df=sales_history_df,
                 send_live=send_live,
                 test_email=test_email
             )
@@ -1385,6 +1472,20 @@ def render_reporting_page(reps_df):
 
         st.subheader("Master Pay Preview")
         st.dataframe(result["pay_entries"], use_container_width=True)
+
+        st.subheader("Sales Analytics Preview")
+        leaderboard, fastest_growth, cancelled = build_analytics_tables(
+            result["sales_history_df"],
+            result["folder_name"]
+        )
+
+        tab1, tab2, tab3 = st.tabs(["Leaderboard", "Fastest Growing", "Cancelled %"])
+        with tab1:
+            st.dataframe(leaderboard, use_container_width=True)
+        with tab2:
+            st.dataframe(fastest_growth, use_container_width=True)
+        with tab3:
+            st.dataframe(cancelled, use_container_width=True)
 
         st.subheader("Email Delivery Preview / Log")
         st.dataframe(result["email_log_df"], use_container_width=True)
@@ -1628,8 +1729,34 @@ elif page == "Rep Directory":
 elif page == "Sales Dashboard":
     st.title("Sales Dashboard")
 
+    sales_history_df = load_sales_history()
+
+    if not sales_history_df.empty:
+        st.subheader("Real Sales History Analytics")
+
+        history_df = normalize_history_df(sales_history_df)
+        periods = sorted(history_df["ReportPeriod"].dropna().astype(str).unique().tolist(), key=period_sort_key)
+
+        if periods:
+            selected_period = st.selectbox("Report Period", periods, index=len(periods) - 1)
+
+            leaderboard, fastest_growth, cancelled = build_analytics_tables(history_df, selected_period)
+
+            tab1, tab2, tab3 = st.tabs(["Leaderboard", "Fastest Growing", "Cancelled %"])
+            with tab1:
+                st.dataframe(leaderboard, use_container_width=True)
+                if not leaderboard.empty:
+                    st.bar_chart(leaderboard.set_index("RepName")["Sales"])
+            with tab2:
+                st.dataframe(fastest_growth, use_container_width=True)
+            with tab3:
+                st.dataframe(cancelled, use_container_width=True)
+
+            st.markdown("---")
+
     if sales_df.empty:
-        st.warning("No sales data found in rep_sales.")
+        if sales_history_df.empty:
+            st.warning("No sales data found yet. Run a commission report to populate rep_sales_history.")
         st.stop()
 
     total_revenue = sales_df["Revenue"].sum()
