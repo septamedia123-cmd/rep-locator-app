@@ -350,8 +350,15 @@ def generate_next_rep_id(existing_df):
 # REPORTING ENGINE
 # =========================
 REPORTS_PARENT_FOLDER_ID = st.secrets.get("REPORTS_PARENT_FOLDER_ID", "")
-SENDER_EMAIL = st.secrets.get("SENDER_EMAIL", "")
-SENDER_APP_PASSWORD = st.secrets.get("SENDER_APP_PASSWORD", "")
+
+# Email sender settings.
+# The app password is normalized because Google often displays app passwords with spaces.
+SENDER_EMAIL = str(st.secrets.get("SENDER_EMAIL", "")).strip()
+SENDER_APP_PASSWORD = (
+    str(st.secrets.get("SENDER_APP_PASSWORD", ""))
+    .replace(" ", "")
+    .strip()
+)
 
 COMMISSION_LEVELS = {
     1: {"name": 20, "pct": 21, "comm": 22},  # U-W
@@ -1630,7 +1637,11 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
     email_log = []
     if send_live:
         if not SENDER_EMAIL or not SENDER_APP_PASSWORD:
-            raise RuntimeError("Missing SENDER_EMAIL or SENDER_APP_PASSWORD in Streamlit secrets.")
+            raise RuntimeError(
+                "Live email mode is ON, but SENDER_EMAIL or SENDER_APP_PASSWORD is missing. "
+                "Check Streamlit Secrets, save them, then reboot the app. "
+                "You can also turn TEST MODE back on to generate reports without sending emails."
+            )
 
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
@@ -1701,6 +1712,15 @@ def render_reporting_page(reps_df):
     if missing:
         st.warning("Missing Streamlit secrets: " + ", ".join(missing))
 
+    sender_ready = bool(SENDER_EMAIL and SENDER_APP_PASSWORD)
+    if sender_ready:
+        st.success(f"Email sender loaded: {SENDER_EMAIL}")
+    else:
+        st.warning(
+            "Live email sender is not fully loaded yet. "
+            "Reports can still be generated in TEST MODE."
+        )
+
     uploaded = st.file_uploader("Upload raw Nu Life commission CSV", type=["csv"])
 
     c1, c2, c3 = st.columns(3)
@@ -1721,6 +1741,14 @@ def render_reporting_page(reps_df):
 
         if not test_mode and confirm_live.strip().upper() != "SEND":
             st.error("Live mode requires typing SEND.")
+            st.stop()
+
+        if send_live and (not SENDER_EMAIL or not SENDER_APP_PASSWORD):
+            st.error(
+                "Live email mode is ON, but the app cannot see SENDER_EMAIL or "
+                "SENDER_APP_PASSWORD. Save Streamlit Secrets, reboot the app, "
+                "or turn TEST MODE back on."
+            )
             st.stop()
 
         with st.spinner("Generating reports..."):
