@@ -23,6 +23,7 @@ from googleapiclient.http import MediaFileUpload
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, LineChart, Reference
 
 st.set_page_config(page_title="Nu Life Admin App", page_icon="📍", layout="wide")
 
@@ -653,6 +654,229 @@ def add_override_detail_sheet(wb, sheet_name, title, headers, rows, rate, subtot
     apply_widths(ws)
     return qualifying_revenue, due
 
+
+def find_product_column(headers):
+    """
+    Finds the most likely product/item column in the raw commission report.
+    """
+    preferred_terms = [
+        "product", "product name", "item", "item name", "sku",
+        "description", "line item", "top product", "ordered product"
+    ]
+
+    normalized_headers = [report_norm(h) for h in headers]
+
+    for term in preferred_terms:
+        for idx, header in enumerate(normalized_headers):
+            if term in header:
+                return idx
+
+    return None
+
+def unique_non_cancelled_orders(rows, headers):
+    """
+    De-duplicates rows by invoice/order number if column B exists.
+    Cancelled orders are excluded from sales charts.
+    """
+    seen = set()
+    cleaned = []
+
+    for row in rows:
+        row = row + [""] * (len(headers) - len(row))
+
+        if is_cancelled_order(row):
+            continue
+
+        invoice = report_clean(row[1] if len(row) > 1 else "")
+        key = invoice if invoice else "|".join(str(x) for x in row[:10])
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        cleaned.append(row)
+
+    return cleaned
+
+def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period):
+    """
+    Adds Monthly Summary, Product Summary, and Charts tabs to each rep workbook.
+
+    Metrics:
+    - Total Orders = count of non-cancelled unique orders
+    - Total Sales = sum of Sub Total column L
+    - Average Order = Total Sales / Total Orders
+    - Top Products = top 3 product names by order count
+    """
+    orders = unique_non_cancelled_orders(source_rows, headers)
+
+    total_orders = len(orders)
+    total_sales = sum(report_money(row[SUBTOTAL_IDX]) for row in orders)
+    avg_order = total_sales / total_orders if total_orders else 0
+
+    product_idx = find_product_column(headers)
+    product_counts = defaultdict(int)
+
+    if product_idx is not None:
+        for row in orders:
+            product = report_clean(row[product_idx] if product_idx < len(row) else "")
+            if product:
+                product_counts[product] += 1
+
+    top_products = sorted(product_counts.items(), key=lambda item: item[1], reverse=True)[:3]
+
+    blue = PatternFill("solid", fgColor="1F4E78")
+    light = PatternFill("solid", fgColor="D9EAF7")
+
+    # Monthly Summary
+    ws = wb.create_sheet("Monthly Summary")
+    ws["A1"] = f"{rep_name} Sales Summary"
+    ws["A1"].font = Font(size=16, bold=True)
+    ws["A1"].alignment = Alignment(horizontal="left")
+
+    summary_headers = ["Period", "Total Orders", "Total Sales", "Average Order"]
+    for c, h in enumerate(summary_headers, 1):
+        cell = ws.cell(3, c, h)
+        cell.fill = blue
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center")
+
+    ws["A4"] = period
+    ws["B4"] = total_orders
+    ws["C4"] = round(total_sales, 2)
+    ws["D4"] = round(avg_order, 2)
+    ws["C4"].number_format = "$#,##0.00"
+    ws["D4"].number_format = "$#,##0.00"
+
+    ws["F3"] = "Metric"
+    ws["G3"] = "Value"
+    ws["F3"].fill = blue
+    ws["G3"].fill = blue
+    ws["F3"].font = Font(bold=True, color="FFFFFF")
+    ws["G3"].font = Font(bold=True, color="FFFFFF")
+
+    metrics = [
+        ("Total Orders", total_orders),
+        ("Total Sales", round(total_sales, 2)),
+        ("Average Order", round(avg_order, 2)),
+    ]
+
+    for r, (metric, value) in enumerate(metrics, 4):
+        ws[f"F{r}"] = metric
+        ws[f"G{r}"] = value
+        ws[f"F{r}"].font = Font(bold=True)
+        if metric != "Total Orders":
+            ws[f"G{r}"].number_format = "$#,##0.00"
+
+    for cell in ws["A1:G1"][0]:
+        cell.fill = light
+
+    apply_widths(ws)
+
+    # Product Summary
+    ps = wb.create_sheet("Product Summary")
+    ps["A1"] = f"{rep_name} Top Products"
+    ps["A1"].font = Font(size=16, bold=True)
+
+    ps_headers = ["Rank", "Product", "Orders"]
+    for c, h in enumerate(ps_headers, 1):
+        cell = ps.cell(3, c, h)
+        cell.fill = blue
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center")
+
+    if top_products:
+        for r, (product, count) in enumerate(top_products, 4):
+            ps.cell(r, 1, r - 3)
+            ps.cell(r, 2, product)
+            ps.cell(r, 3, count)
+    else:
+        ps["A4"] = "No product column detected"
+        ps["B4"] = "Confirm portal export product column"
+        ps["C4"] = 0
+
+    apply_widths(ps)
+
+    # Charts
+    charts = wb.create_sheet("Charts")
+    charts["A1"] = f"{rep_name} Sales Charts"
+    charts["A1"].font = Font(size=16, bold=True)
+
+    charts["A3"] = "Period"
+    charts["B3"] = "Total Orders"
+    charts["C3"] = "Total Sales"
+    charts["D3"] = "Average Order"
+    charts["A4"] = period
+    charts["B4"] = total_orders
+    charts["C4"] = round(total_sales, 2)
+    charts["D4"] = round(avg_order, 2)
+    charts["C4"].number_format = "$#,##0.00"
+    charts["D4"].number_format = "$#,##0.00"
+
+    charts["F3"] = "Product"
+    charts["G3"] = "Orders"
+    if top_products:
+        for r, (product, count) in enumerate(top_products, 4):
+            charts.cell(r, 6, product)
+            charts.cell(r, 7, count)
+    else:
+        charts["F4"] = "No product data"
+        charts["G4"] = 0
+
+    for cell in charts["A3:D3"][0] + charts["F3:G3"][0]:
+        cell.fill = blue
+        cell.font = Font(bold=True, color="FFFFFF")
+
+    orders_chart = BarChart()
+    orders_chart.title = "Total Orders for Period"
+    orders_chart.y_axis.title = "Orders"
+    orders_chart.x_axis.title = "Period"
+    orders_chart.add_data(Reference(charts, min_col=2, min_row=3, max_row=4), titles_from_data=True)
+    orders_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=4))
+    orders_chart.height = 8
+    orders_chart.width = 14
+    charts.add_chart(orders_chart, "A8")
+
+    sales_chart = LineChart()
+    sales_chart.title = "Total Sales for Period ($)"
+    sales_chart.y_axis.title = "Sales"
+    sales_chart.x_axis.title = "Period"
+    sales_chart.add_data(Reference(charts, min_col=3, min_row=3, max_row=4), titles_from_data=True)
+    sales_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=4))
+    sales_chart.height = 8
+    sales_chart.width = 14
+    charts.add_chart(sales_chart, "I8")
+
+    avg_chart = BarChart()
+    avg_chart.title = "Average Order Amount"
+    avg_chart.y_axis.title = "Average Order"
+    avg_chart.x_axis.title = "Period"
+    avg_chart.add_data(Reference(charts, min_col=4, min_row=3, max_row=4), titles_from_data=True)
+    avg_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=4))
+    avg_chart.height = 8
+    avg_chart.width = 14
+    charts.add_chart(avg_chart, "A24")
+
+    product_chart = BarChart()
+    product_chart.title = "Top 3 Most Ordered Products"
+    product_chart.y_axis.title = "Orders"
+    product_chart.x_axis.title = "Product"
+    product_data_end = max(4, 3 + len(top_products))
+    product_chart.add_data(Reference(charts, min_col=7, min_row=3, max_row=product_data_end), titles_from_data=True)
+    product_chart.set_categories(Reference(charts, min_col=6, min_row=4, max_row=product_data_end))
+    product_chart.height = 8
+    product_chart.width = 14
+    charts.add_chart(product_chart, "I24")
+
+    apply_widths(charts)
+
+    return {
+        "orders": total_orders,
+        "sales": round(total_sales, 2),
+        "average_order": round(avg_order, 2),
+        "top_products": top_products,
+    }
+
 def build_commission_package(uploaded_file, reps_df, send_live=False, test_email=""):
     temp_root = tempfile.mkdtemp(prefix="nulife_reports_")
     source_path = os.path.join(temp_root, uploaded_file.name)
@@ -724,6 +948,20 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
 
         total_due = regular_due + override_due
 
+        # Sales insights and charts for the rep workbook.
+        # Uses real order data from the uploaded commission report.
+        all_rep_source_rows = []
+        for level_rows in rep_level_rows[rep_name].values():
+            all_rep_source_rows.extend(level_rows)
+
+        sales_metrics = add_sales_insight_tabs(
+            wb,
+            rep_name,
+            all_rep_source_rows,
+            headers,
+            period
+        )
+
         file_name = f"{safe_filename(rep_name)} {period}.xlsx"
         file_path = os.path.join(rep_dir, file_name)
         wb.save(file_path)
@@ -737,6 +975,10 @@ def build_commission_package(uploaded_file, reps_df, send_live=False, test_email
             "Report File": file_name,
             "Rows": row_count,
             "Cancelled": cancelled_count,
+            "Orders": sales_metrics.get("orders", 0),
+            "Sales": sales_metrics.get("sales", 0),
+            "Average Order": sales_metrics.get("average_order", 0),
+            "Top Products": ", ".join([p for p, c in sales_metrics.get("top_products", [])]),
             "Path": file_path,
         })
 
@@ -1146,6 +1388,17 @@ def render_reporting_page(reps_df):
 
         st.subheader("Email Delivery Preview / Log")
         st.dataframe(result["email_log_df"], use_container_width=True)
+
+        email_log_file = os.path.join(result["package_dir"], "email_delivery_log.xlsx")
+        if os.path.exists(email_log_file):
+            with open(email_log_file, "rb") as f:
+                st.download_button(
+                    "Download Email Delivery Log",
+                    data=f,
+                    file_name="email_delivery_log.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
 
         with open(result["zip_path"], "rb") as f:
             st.download_button(
