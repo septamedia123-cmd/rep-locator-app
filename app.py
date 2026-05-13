@@ -753,6 +753,275 @@ def unique_non_cancelled_orders(rows, headers):
 
     return cleaned
 
+
+def extract_month_from_period(period):
+    text = report_clean(period)
+    match = re.search(r"(\d{1,2})\.(\d{1,2}).*?(\d{4})", text)
+
+    if not match:
+        return text
+
+    month_num = int(match.group(1))
+    year = int(match.group(3))
+
+    month_names = [
+        "", "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ]
+
+    if 1 <= month_num <= 12:
+        return f"{month_names[month_num]} {year}"
+
+    return text
+
+
+def period_sort_key(period):
+    text = report_clean(period)
+    match = re.search(r"(\d{1,2})\.(\d{1,2}).*?(\d{4})", text)
+
+    if not match:
+        return (9999, 99, 99, text)
+
+    month = int(match.group(1))
+    day = int(match.group(2))
+    year = int(match.group(3))
+
+    return (year, month, day, text)
+
+
+def normalize_history_df(history_df):
+    if history_df is None or history_df.empty:
+        return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
+
+    df = history_df.copy()
+
+    for col in SALES_HISTORY_HEADERS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[SALES_HISTORY_HEADERS].copy()
+
+    numeric_cols = [
+        "Orders",
+        "Sales",
+        "AverageOrder",
+        "CancelledOrders",
+        "TotalRows",
+        "CancelledRate",
+    ]
+
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    return df
+
+
+def upsert_sales_history(existing_history_df, new_history_rows):
+    history_df = normalize_history_df(existing_history_df)
+    new_df = pd.DataFrame(new_history_rows)
+
+    if new_df.empty:
+        return history_df
+
+    for col in SALES_HISTORY_HEADERS:
+        if col not in new_df.columns:
+            new_df[col] = ""
+
+    new_df = new_df[SALES_HISTORY_HEADERS].copy()
+
+    numeric_cols = [
+        "Orders",
+        "Sales",
+        "AverageOrder",
+        "CancelledOrders",
+        "TotalRows",
+        "CancelledRate",
+    ]
+
+    for col in numeric_cols:
+        new_df[col] = pd.to_numeric(new_df[col], errors="coerce").fillna(0)
+
+    if not history_df.empty:
+        new_keys = set(
+            zip(
+                new_df["RepName"].astype(str),
+                new_df["ReportPeriod"].astype(str),
+            )
+        )
+
+        history_df = history_df[
+            ~history_df.apply(
+                lambda row: (
+                    str(row["RepName"]),
+                    str(row["ReportPeriod"])
+                ) in new_keys,
+                axis=1
+            )
+        ]
+
+    combined = pd.concat([history_df, new_df], ignore_index=True)
+    combined["_sort"] = combined["ReportPeriod"].apply(period_sort_key)
+    combined = combined.sort_values(["RepName", "_sort"]).drop(columns=["_sort"])
+
+    return combined[SALES_HISTORY_HEADERS]
+
+
+def create_sales_history_row(rep_name, period, metrics, generated_at):
+    top_products = metrics.get("top_products", [])
+    top_names = [name for name, count in top_products]
+
+    total_rows = int(metrics.get("total_rows", 0))
+    cancelled_orders = int(metrics.get("cancelled_orders", 0))
+    cancelled_rate = (cancelled_orders / total_rows) if total_rows else 0
+
+    return {
+        "ReportPeriod": period,
+        "Month": extract_month_from_period(period),
+        "RepName": rep_name,
+        "Orders": int(metrics.get("orders", 0)),
+        "Sales": round(float(metrics.get("sales", 0)), 2),
+        "AverageOrder": round(float(metrics.get("average_order", 0)), 2),
+        "TopProduct1": top_names[0] if len(top_names) > 0 else "",
+        "TopProduct2": top_names[1] if len(top_names) > 1 else "",
+        "TopProduct3": top_names[2] if len(top_names) > 2 else "",
+        "CancelledOrders": cancelled_orders,
+        "TotalRows": total_rows,
+        "CancelledRate": round(cancelled_rate, 4),
+        "GeneratedAt": generated_at,
+    }
+
+
+def build_analytics_tables(history_df, current_period):
+    df = normalize_history_df(history_df)
+
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    current_df = df[
+        df["ReportPeriod"].astype(str) == str(current_period)
+    ].copy()
+
+    if current_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    leaderboard = current_df.sort_values("Sales", ascending=False)[
+        [
+            "RepName",
+            "Orders",
+            "Sales",
+            "AverageOrder",
+            "CancelledOrders",
+            "CancelledRate",
+        ]
+    ].copy()
+
+    growth_rows = []
+
+    for rep_name, rep_df in df.groupby("RepName"):
+        rep_df = rep_df.copy()
+        rep_df["_sort"] = rep_df["ReportPeriod"].apply(period_sort_key)
+        rep_df = rep_df.sort_values("_sort")
+
+        current_rows = rep_df[
+            rep_df["ReportPeriod"].astype(str) == str(current_period)
+        ]
+
+        if current_rows.empty:
+            continue
+
+        current_sales = float(current_rows.iloc[-1]["Sales"])
+        prior_rows = rep_df[
+            rep_df["ReportPeriod"].astype(str) != str(current_period)
+        ]
+
+        if prior_rows.empty:
+            prior_sales = 0.0
+            growth_amount = current_sales
+            growth_percent = 0.0
+        else:
+            prior_sales = float(prior_rows.iloc[-1]["Sales"])
+            growth_amount = current_sales - prior_sales
+            growth_percent = (growth_amount / prior_sales) if prior_sales else 0.0
+
+        growth_rows.append({
+            "RepName": rep_name,
+            "PreviousSales": round(prior_sales, 2),
+            "CurrentSales": round(current_sales, 2),
+            "GrowthAmount": round(growth_amount, 2),
+            "GrowthPercent": round(growth_percent, 4),
+        })
+
+    fastest_growth = pd.DataFrame(growth_rows)
+
+    if not fastest_growth.empty:
+        fastest_growth = fastest_growth.sort_values(
+            ["GrowthAmount", "GrowthPercent"],
+            ascending=False
+        )
+
+    cancelled = current_df.sort_values("CancelledRate", ascending=False)[
+        ["RepName", "CancelledOrders", "TotalRows", "CancelledRate"]
+    ].copy()
+
+    return leaderboard, fastest_growth, cancelled
+
+
+def create_sales_analytics_workbook(history_df, current_period):
+    leaderboard, fastest_growth, cancelled = build_analytics_tables(
+        history_df,
+        current_period
+    )
+
+    wb = Workbook()
+    blue = PatternFill("solid", fgColor="1F4E78")
+    light = PatternFill("solid", fgColor="D9EAF7")
+
+    def write_df(sheet, title, df):
+        sheet["A1"] = title
+        sheet["A1"].font = Font(size=16, bold=True)
+        sheet["A1"].alignment = Alignment(horizontal="left")
+        sheet["A1"].fill = light
+
+        if df.empty:
+            sheet["A3"] = "No data available yet."
+            apply_widths(sheet)
+            return
+
+        for c, col in enumerate(df.columns, 1):
+            cell = sheet.cell(3, c, col)
+            cell.fill = blue
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center")
+
+        for r_idx, row in enumerate(df.itertuples(index=False), 4):
+            for c_idx, value in enumerate(row, 1):
+                sheet.cell(r_idx, c_idx, value)
+
+        for row_cells in sheet.iter_rows(min_row=4):
+            for cell in row_cells:
+                header = str(sheet.cell(3, cell.column).value)
+                if isinstance(cell.value, float):
+                    if "Rate" in header or "Percent" in header:
+                        cell.number_format = "0.00%"
+                    else:
+                        cell.number_format = "$#,##0.00"
+
+        apply_widths(sheet)
+
+    ws = wb.active
+    ws.title = "Leaderboard"
+    write_df(ws, f"Leaderboard - {current_period}", leaderboard)
+
+    ws2 = wb.create_sheet("Fastest Growing")
+    write_df(ws2, f"Fastest Growing Reps - {current_period}", fastest_growth)
+
+    ws3 = wb.create_sheet("Cancelled Rate")
+    write_df(ws3, f"Cancelled Order % - {current_period}", cancelled)
+
+    return wb
+
+
+
 def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period, history_df=None):
     """
     Adds Monthly Summary, Product Summary, and Charts tabs to each rep workbook.
@@ -1907,3 +2176,5 @@ elif page == "Manage Reps":
         if st.button("Discard Changes / Refresh", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
+
+   
