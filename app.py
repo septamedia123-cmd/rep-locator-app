@@ -2234,5 +2234,3 @@ elif page == "Manage Reps":
         if st.button("Discard Changes / Refresh", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
-
-   
