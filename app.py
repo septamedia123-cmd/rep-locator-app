@@ -501,6 +501,28 @@ def apply_widths(ws):
         max_len = max(len(str(cell.value or "")) for cell in ws[letter])
         ws.column_dimensions[letter].width = min(max_len + 3, 45)
 
+
+def should_force_alex_20(rep_name, level):
+    return report_norm(rep_name) == "alex bethel" and int(level) == 1
+
+
+def force_alex_20_on_display_row(display_row):
+    """
+    Alex Bethel should be paid 20% on his direct Level 1 commission report.
+    After upper columns are removed, Alex's percent is column V and commission is column W.
+    Subtotal is column L.
+    """
+    percent_idx = 21  # V, zero-based after no upper-level removal for Level 1
+    commission_idx = 22  # W
+    subtotal_idx = SUBTOTAL_IDX  # L
+
+    if len(display_row) > commission_idx:
+        display_row[percent_idx] = "20%"
+        display_row[commission_idx] = round(report_money(display_row[subtotal_idx]) * 0.20, 2)
+
+    return display_row
+
+
 def write_report_sheet(ws, rep_name, level, rows, headers, period):
     blue = PatternFill("solid", fgColor="1F4E78")
     light = PatternFill("solid", fgColor="D9EAF7")
@@ -523,7 +545,12 @@ def write_report_sheet(ws, rep_name, level, rows, headers, period):
     prepared = []
     for r in rows:
         r = r + [""] * (len(headers) - len(r))
-        prepared.append([r[i] for i in keep])
+        display_row = [r[i] for i in keep]
+
+        if should_force_alex_20(rep_name, level):
+            display_row = force_alex_20_on_display_row(display_row)
+
+        prepared.append(display_row)
 
     prepared.sort(key=lambda row: (
         report_norm(row[17]) if len(row) > 17 else "",
@@ -597,6 +624,12 @@ def make_cleaned_raw_workbook(title, headers, data):
     for rr, row in enumerate(data, 3):
         row = row + [""] * (len(headers) - len(row))
         cancelled = is_cancelled_order(row)
+
+        # Force Alex Bethel direct commission from 19% to 20%.
+        if not cancelled and report_norm(row[COMMISSION_LEVELS[1]["name"]]) == "alex bethel":
+            row[COMMISSION_LEVELS[1]["pct"]] = "20%"
+            row[COMMISSION_LEVELS[1]["comm"]] = round(report_money(row[SUBTOTAL_IDX]) * 0.20, 2)
+
         for cc, val in enumerate(row, 1):
             raw_idx = cc - 1
             if cancelled and raw_idx in commission_cols:
@@ -1293,6 +1326,17 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
         for level_rows in rep_level_rows[rep_name].values():
             all_rep_source_rows.extend(level_rows)
 
+        if report_norm(rep_name) == "alex bethel":
+            corrected_rows = []
+            for source_row in all_rep_source_rows:
+                source_row = source_row[:]
+                source_row = source_row + [""] * (len(headers) - len(source_row))
+                if not is_cancelled_order(source_row) and report_norm(source_row[COMMISSION_LEVELS[1]["name"]]) == "alex bethel":
+                    source_row[COMMISSION_LEVELS[1]["pct"]] = "20%"
+                    source_row[COMMISSION_LEVELS[1]["comm"]] = round(report_money(source_row[SUBTOTAL_IDX]) * 0.20, 2)
+                corrected_rows.append(source_row)
+            all_rep_source_rows = corrected_rows
+
         sales_metrics = add_sales_insight_tabs(
             wb,
             rep_name,
@@ -1690,6 +1734,7 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
         "zip_path": zip_path,
         "package_dir": package_dir,
         "drive_folder_link": drive_folder_link,
+        "drive_files_uploaded": drive_files_uploaded,
         "pay_entries": pd.DataFrame(pay_entries).drop(columns=["Path"]),
         "delivery_df": delivery_df.drop(columns=["Path"]),
         "email_log_df": email_log_df,
@@ -1745,7 +1790,12 @@ def render_reporting_page(reps_df):
         st.success(f"Generated {result['reports_count']} report(s).")
 
         if result["drive_folder_link"]:
+            st.success("ZIP uploaded to Google Drive.")
             st.markdown(f"**Drive ZIP:** {result['drive_folder_link']}")
+        else:
+            st.warning("ZIP was generated, but it was not uploaded to Google Drive. Use the download button below.")
+            if result.get("drive_files_uploaded"):
+                st.caption(str(result.get("drive_files_uploaded")[-1]))
 
         st.subheader("Master Pay Preview")
         st.dataframe(result["pay_entries"], use_container_width=True)
