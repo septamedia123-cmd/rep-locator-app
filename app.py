@@ -365,6 +365,145 @@ SUBTOTAL_IDX = 11
 CUSTOMER_EMAIL_IDX = 5
 TRUE_COST_IDX = 44
 
+SENSITIVE_REPORT_TERMS = [
+    "base cost",
+    "base price",
+    "true cost",
+    "cost",
+    "vendor cost",
+    "wholesale cost",
+    "internal cost",
+    "internal price",
+    "profit",
+    "margin",
+    "markup",
+    "cogs",
+]
+
+def is_sensitive_report_header(value):
+    text = report_norm(value)
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    for term in SENSITIVE_REPORT_TERMS:
+        term_norm = term.lower()
+        term_compact = re.sub(r"[^a-z0-9]+", "", term_norm)
+        if term_norm in text or term_compact in compact:
+            return True
+    return False
+
+def sensitive_header_indexes(headers):
+    return {i for i, h in enumerate(headers) if is_sensitive_report_header(h)}
+
+def workbook_sensitive_scan(path):
+    """
+    Opens a generated workbook and looks for sensitive internal pricing/cost headers.
+    Returns a list of findings.
+    """
+    findings = []
+    try:
+        wb = load_workbook(path, read_only=True, data_only=False)
+        for ws in wb.worksheets:
+            max_scan_row = min(ws.max_row, 8)
+            for row in ws.iter_rows(min_row=1, max_row=max_scan_row):
+                for cell in row:
+                    if is_sensitive_report_header(cell.value):
+                        findings.append({
+                            "file": os.path.basename(path),
+                            "sheet": ws.title,
+                            "cell": cell.coordinate,
+                            "value": str(cell.value),
+                        })
+    except Exception as e:
+        findings.append({
+            "file": os.path.basename(path),
+            "sheet": "",
+            "cell": "",
+            "value": f"Could not scan workbook: {type(e).__name__}: {str(e)}",
+        })
+    return findings
+
+def scan_generated_report_files(report_paths):
+    findings = []
+    for path in report_paths:
+        if path and os.path.exists(path) and path.lower().endswith(".xlsx"):
+            findings.extend(workbook_sensitive_scan(path))
+    return findings
+
+def send_commission_report_emails(result, test_email=""):
+    """
+    Sends already-generated and admin-reviewed rep report files.
+    This intentionally runs AFTER the preview/approval gate.
+    """
+    if not SENDER_EMAIL or not SENDER_APP_PASSWORD:
+        raise RuntimeError("Missing SENDER_EMAIL or SENDER_APP_PASSWORD in Streamlit secrets.")
+
+    delivery_df = result.get("delivery_df", pd.DataFrame()).copy()
+    if delivery_df.empty:
+        raise RuntimeError("No delivery rows found. Generate reports first.")
+
+    pay_entries = result.get("pay_entries", pd.DataFrame()).copy()
+    path_lookup = {}
+    if not pay_entries.empty and "Report File" in pay_entries.columns and "Path" in pay_entries.columns:
+        for _, row in pay_entries.iterrows():
+            path_lookup[str(row.get("Report File", ""))] = row.get("Path", "")
+
+    folder_name = result.get("folder_name", "Nu Life Commission Report")
+    email_log = []
+
+    server = smtplib.SMTP("smtp.gmail.com", 587)
+    server.starttls()
+    server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
+
+    try:
+        for _, item in delivery_df.iterrows():
+            item_dict = item.to_dict()
+            send_to = report_clean(item_dict.get("Send To", ""))
+
+            if not send_to:
+                email_log.append({**item_dict, "Email Status": "SKIPPED - Missing email"})
+                continue
+
+            to_email = test_email.strip() if test_email.strip() else send_to
+            report_file = report_clean(item_dict.get("Report File", ""))
+            report_path = path_lookup.get(report_file, "")
+
+            if not report_path or not os.path.exists(report_path):
+                email_log.append({**item_dict, "Email Status": "SKIPPED - Report file missing"})
+                continue
+
+            scan_findings = workbook_sensitive_scan(report_path)
+            if scan_findings:
+                raise RuntimeError(
+                    "SEND BLOCKED: sensitive cost/base-cost header detected before email send: "
+                    + str(scan_findings[:5])
+                )
+
+            msg = EmailMessage()
+            msg["Subject"] = folder_name
+            msg["From"] = SENDER_EMAIL
+            msg["To"] = to_email
+            msg.set_content(
+                f"Hello {item_dict.get('Rep Name', '')},\n\n"
+                f"Attached is your Nu Life commission report for this period.\n\n"
+                f"Please review your report carefully.\n\n"
+                f"Thank you,\nNu Life Essentials\n"
+            )
+
+            with open(report_path, "rb") as f:
+                msg.add_attachment(
+                    f.read(),
+                    maintype="application",
+                    subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    filename=report_file
+                )
+
+            server.send_message(msg)
+            email_log.append({**item_dict, "Email Status": f"SENT to {to_email}"})
+
+    finally:
+        server.quit()
+
+    return pd.DataFrame(email_log)
+
 JOEL_NELSON_RATE = 0.025
 HOWARD_FINDER_RATE = 0.05
 HOWARD_CLIENT_EMAILS = {
@@ -489,10 +628,14 @@ def upload_file_to_drive(service, local_path, folder_id, drive_name=None):
     return uploaded
 
 def keep_cols_for_level(headers, level):
+    # Remove the known internal true-cost index AND any column whose header looks like cost/base cost/profit/margin.
     drop = {TRUE_COST_IDX}
+    drop.update(sensitive_header_indexes(headers))
+
     for lvl in range(1, level):
         start = COMMISSION_LEVELS[lvl]["name"]
         drop.update([start, start + 1, start + 2])
+
     return [i for i in range(len(headers)) if i not in drop]
 
 def apply_widths(ws):
@@ -696,7 +839,7 @@ def add_override_detail_sheet(wb, sheet_name, title, headers, rows, rate, subtot
     light = PatternFill("solid", fgColor="D9EAF7")
     red = PatternFill("solid", fgColor="FFC7CE")
 
-    keep = [i for i in range(len(headers)) if i != TRUE_COST_IDX]
+    keep = [i for i in range(len(headers)) if i != TRUE_COST_IDX and i not in sensitive_header_indexes(headers)]
     ws["A1"] = title
     ws["A1"].font = Font(size=16, bold=True)
     ws["A1"].alignment = Alignment(horizontal="left")
@@ -1282,6 +1425,7 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
     alex_override_revenue, alex_override_due, alex_override_rows = calculate_alex_override(data)
 
     pay_entries = []
+    report_file_paths = []
     delivery_rows = []
     history_update_rows = []
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1353,6 +1497,7 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
         file_name = f"{safe_filename(rep_name)} {period}.xlsx"
         file_path = os.path.join(rep_dir, file_name)
         wb.save(file_path)
+        report_file_paths.append(file_path)
 
         pay_entries.append({
             "Rep Name": rep_name,
@@ -1391,6 +1536,7 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
         file_name = f"Joel Override {period}.xlsx"
         file_path = os.path.join(rep_dir, file_name)
         wb.save(file_path)
+        report_file_paths.append(file_path)
         pay_entries.append({
             "Rep Name": "Joel",
             "Regular Commission": 0,
@@ -1425,6 +1571,7 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
         file_name = f"Howard Finder Fee {period}.xlsx"
         file_path = os.path.join(rep_dir, file_name)
         wb.save(file_path)
+        report_file_paths.append(file_path)
         pay_entries.append({
             "Rep Name": "Howard",
             "Regular Commission": 0,
@@ -1678,53 +1825,17 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
             drive_folder_link = ""
             drive_files_uploaded.append(f"Drive upload failed: {type(e).__name__}: {str(e)}")
 
-    # Email send or test preview
+    # Email preview only.
+    # Actual email sending is intentionally separated and locked behind the Admin Review gate.
     email_log = []
-    if send_live:
-        if not SENDER_EMAIL or not SENDER_APP_PASSWORD:
-            raise RuntimeError("Missing SENDER_EMAIL or SENDER_APP_PASSWORD in Streamlit secrets.")
-
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
-
-        for item in delivery_rows:
-            if not item["Send To"]:
-                email_log.append({**item, "Email Status": "SKIPPED - Missing email"})
-                continue
-
+    for item in delivery_rows:
+        if not item["Send To"]:
+            email_log.append({**item, "Email Status": "PREVIEW - Missing email"})
+        else:
             to_email = test_email.strip() if test_email.strip() else item["Send To"]
+            email_log.append({**item, "Email Status": f"PREVIEW - Would send to {to_email}"})
 
-            msg = EmailMessage()
-            msg["Subject"] = folder_name
-            msg["From"] = SENDER_EMAIL
-            msg["To"] = to_email
-            msg.set_content(
-                f"Hello {item['Rep Name']},\n\n"
-                f"Attached is your Nu Life commission report for this period.\n\n"
-                f"Please review your report carefully.\n\n"
-                f"Thank you,\nNu Life Essentials\n"
-            )
-
-            with open(item["Path"], "rb") as f:
-                msg.add_attachment(
-                    f.read(),
-                    maintype="application",
-                    subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    filename=item["Report File"]
-                )
-
-            server.send_message(msg)
-            email_log.append({**item, "Email Status": f"SENT to {to_email}"})
-
-        server.quit()
-    else:
-        for item in delivery_rows:
-            if not item["Send To"]:
-                email_log.append({**item, "Email Status": "TEST - Missing email"})
-            else:
-                email_log.append({**item, "Email Status": f"TEST - Would send to {item['Send To']}"})
-
+    sensitive_scan_findings = scan_generated_report_files(report_file_paths)
     email_log_df = pd.DataFrame(email_log).drop(columns=["Path"])
     email_log_path = os.path.join(package_dir, "email_delivery_log.xlsx")
     email_log_df.to_excel(email_log_path, index=False)
@@ -1735,16 +1846,18 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
         "package_dir": package_dir,
         "drive_folder_link": drive_folder_link,
         "drive_files_uploaded": drive_files_uploaded,
-        "pay_entries": pd.DataFrame(pay_entries).drop(columns=["Path"]),
+        "pay_entries": pd.DataFrame(pay_entries),
         "delivery_df": delivery_df.drop(columns=["Path"]),
         "email_log_df": email_log_df,
+        "report_file_paths": report_file_paths,
+        "sensitive_scan_findings": sensitive_scan_findings,
         "reports_count": len(pay_entries),
         "sales_history_df": updated_sales_history_df,
     }
 
 def render_reporting_page(reps_df):
     st.title("Reporting")
-    st.caption("Upload Nu Life commission CSV, generate reports, save to Drive, and email reps.")
+    st.caption("Upload Nu Life commission CSV, generate reports, review output, then approve and email reps.")
 
     missing = []
     for key in ["REPORTS_PARENT_FOLDER_ID", "SENDER_EMAIL", "SENDER_APP_PASSWORD"]:
@@ -1769,59 +1882,124 @@ def render_reporting_page(reps_df):
     if uploaded:
         st.success(f"Loaded file: {uploaded.name}")
 
-    if st.button("Generate Reports", type="primary", use_container_width=True, disabled=uploaded is None):
-        send_live = (not test_mode) and confirm_live.strip().upper() == "SEND"
+        uploaded_signature = f"{uploaded.name}_{uploaded.size}"
+        if st.session_state.get("commission_uploaded_signature") != uploaded_signature:
+            st.session_state["commission_uploaded_signature"] = uploaded_signature
+            st.session_state["commission_result"] = None
+            st.session_state["commission_admin_approved"] = False
 
-        if not test_mode and confirm_live.strip().upper() != "SEND":
-            st.error("Live mode requires typing SEND.")
-            st.stop()
+    if "commission_result" not in st.session_state:
+        st.session_state["commission_result"] = None
 
-        with st.spinner("Generating reports..."):
+    if "commission_admin_approved" not in st.session_state:
+        st.session_state["commission_admin_approved"] = False
+
+    if st.button("Generate Reports for Review", type="primary", use_container_width=True, disabled=uploaded is None):
+        # Always generate in preview mode first. Emails are NEVER sent during generation.
+        with st.spinner("Generating reports for admin review..."):
             sales_history_df = load_sales_history()
 
             result = build_commission_package(
                 uploaded,
                 reps_df,
                 sales_history_df=sales_history_df,
-                send_live=send_live,
+                send_live=False,
                 test_email=test_email
             )
 
-        st.success(f"Generated {result['reports_count']} report(s).")
+        st.session_state["commission_result"] = result
+        st.session_state["commission_admin_approved"] = False
+        st.success(f"Generated {result['reports_count']} report(s) for review. Emails are still locked.")
 
-        if result["drive_folder_link"]:
-            st.success("ZIP uploaded to Google Drive.")
-            st.markdown(f"**Drive ZIP:** {result['drive_folder_link']}")
-        else:
-            st.warning("ZIP was generated, but it was not uploaded to Google Drive. Use the download button below.")
-            if result.get("drive_files_uploaded"):
-                st.caption(str(result.get("drive_files_uploaded")[-1]))
+    result = st.session_state.get("commission_result")
 
-        st.subheader("Master Pay Preview")
-        st.dataframe(result["pay_entries"], use_container_width=True)
+    if not result:
+        return
 
-        st.subheader("Sales Analytics Preview")
-        leaderboard, fastest_growth, cancelled = build_analytics_tables(
-            result["sales_history_df"],
-            result["folder_name"]
+    st.markdown("---")
+    st.success(f"Generated {result['reports_count']} report(s). Admin review is required before emails can be sent.")
+
+    if result["drive_folder_link"]:
+        st.success("ZIP uploaded to Google Drive.")
+        st.markdown(f"**Drive ZIP:** {result['drive_folder_link']}")
+    else:
+        st.warning("ZIP was generated, but it was not uploaded to Google Drive. Use the download button below.")
+        if result.get("drive_files_uploaded"):
+            st.caption(str(result.get("drive_files_uploaded")[-1]))
+
+    review_tab, downloads_tab, email_tab, analytics_tab = st.tabs(
+        ["Admin Review", "Downloads", "Email Queue", "Analytics Preview"]
+    )
+
+    with review_tab:
+        st.subheader("Admin Review Required")
+
+        st.warning(
+            "Do not send until you verify that Base Cost / true cost / margin / profit columns are not present "
+            "in the rep-facing workbooks."
         )
 
-        tab1, tab2, tab3 = st.tabs(["Leaderboard", "Fastest Growing", "Cancelled %"])
-        with tab1:
-            st.dataframe(leaderboard, use_container_width=True)
-        with tab2:
-            st.dataframe(fastest_growth, use_container_width=True)
-        with tab3:
-            st.dataframe(cancelled, use_container_width=True)
+        scan_findings = result.get("sensitive_scan_findings", [])
 
-        st.subheader("Email Delivery Preview / Log")
-        st.dataframe(result["email_log_df"], use_container_width=True)
+        if scan_findings:
+            st.error("SEND BLOCKED: Sensitive cost/profit/margin headers were detected in generated report files.")
+            st.dataframe(pd.DataFrame(scan_findings), use_container_width=True)
+            st.session_state["commission_admin_approved"] = False
+        else:
+            st.success("Automated scan passed: no sensitive cost/profit/margin headers were detected in generated report files.")
+
+        st.subheader("Master Pay Preview")
+        display_pay_entries = result["pay_entries"].drop(columns=["Path"], errors="ignore")
+        st.dataframe(display_pay_entries, use_container_width=True)
+
+        st.subheader("Sample Rep Report Preview")
+        sample_paths = result.get("report_file_paths", [])
+        if sample_paths:
+            sample_path = sample_paths[0]
+            st.caption(f"Previewing: {os.path.basename(sample_path)}")
+            try:
+                sample_df = pd.read_excel(sample_path, sheet_name=0, header=None, nrows=25)
+                st.dataframe(sample_df, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Could not preview sample workbook: {e}")
+        else:
+            st.info("No sample report path found.")
+
+        reviewed_sample = st.checkbox("I reviewed the sample rep report preview.", key="reviewed_sample_report")
+        reviewed_zip = st.checkbox("I downloaded and reviewed the ZIP if needed.", key="reviewed_zip_package")
+        confirm_no_cost = st.checkbox(
+            "I confirm no Base Cost / Cost / Vendor Cost / True Cost / Profit / Margin columns are visible in rep reports.",
+            key="confirm_no_cost_columns"
+        )
+
+        can_approve = (not scan_findings) and reviewed_sample and confirm_no_cost
+
+        if st.button(
+            "Approve Batch for Sending",
+            type="primary",
+            use_container_width=True,
+            disabled=not can_approve
+        ):
+            st.session_state["commission_admin_approved"] = True
+            st.success("Batch approved. Go to Email Queue to send.")
+
+        if st.button("Reset Approval", use_container_width=True):
+            st.session_state["commission_admin_approved"] = False
+            st.warning("Approval reset. Emails are locked again.")
+
+        if st.session_state.get("commission_admin_approved"):
+            st.success("ADMIN APPROVAL COMPLETE - email sending is unlocked.")
+        else:
+            st.error("ADMIN APPROVAL REQUIRED - email sending is locked.")
+
+    with downloads_tab:
+        st.subheader("Downloads")
 
         email_log_file = os.path.join(result["package_dir"], "email_delivery_log.xlsx")
         if os.path.exists(email_log_file):
             with open(email_log_file, "rb") as f:
                 st.download_button(
-                    "Download Email Delivery Log",
+                    "Download Email Delivery Preview Log",
                     data=f,
                     file_name="email_delivery_log.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1837,6 +2015,64 @@ def render_reporting_page(reps_df):
                 use_container_width=True
             )
 
+    with email_tab:
+        st.subheader("Email Delivery Preview")
+        st.dataframe(result["email_log_df"], use_container_width=True)
+
+        send_disabled = False
+
+        if not st.session_state.get("commission_admin_approved", False):
+            send_disabled = True
+            st.warning("Admin approval is required before emails can be sent.")
+
+        if not test_mode and confirm_live.strip().upper() != "SEND":
+            send_disabled = True
+            st.error("Live mode requires typing SEND.")
+
+        if test_mode and not test_email.strip():
+            st.info("Test mode is on. If no test email is entered, emails will go to the real rep email after approval. Add a test email override to test safely.")
+
+        send_label = "Send TEST Emails" if test_mode else "Send LIVE Emails"
+        if st.button(send_label, type="primary", use_container_width=True, disabled=send_disabled):
+            if not st.session_state.get("commission_admin_approved", False):
+                st.error("Send blocked because admin approval is missing.")
+                st.stop()
+
+            final_findings = scan_generated_report_files(result.get("report_file_paths", []))
+            if final_findings:
+                st.error("Final send blocked. Sensitive cost/profit/margin headers were detected.")
+                st.dataframe(pd.DataFrame(final_findings), use_container_width=True)
+                st.session_state["commission_admin_approved"] = False
+                st.stop()
+
+            with st.spinner("Sending emails..."):
+                if test_mode and test_email.strip():
+                    send_log_df = send_commission_report_emails(result, test_email=test_email.strip())
+                elif test_mode:
+                    # Safety default: test mode without override should not send.
+                    st.error("Enter a test email override before sending in Test Mode.")
+                    st.stop()
+                else:
+                    send_log_df = send_commission_report_emails(result, test_email="")
+
+            st.success("Emails sent successfully.")
+            st.dataframe(send_log_df, use_container_width=True)
+            st.session_state["commission_admin_approved"] = False
+
+    with analytics_tab:
+        st.subheader("Sales Analytics Preview")
+        leaderboard, fastest_growth, cancelled = build_analytics_tables(
+            result["sales_history_df"],
+            result["folder_name"]
+        )
+
+        tab1, tab2, tab3 = st.tabs(["Leaderboard", "Fastest Growing", "Cancelled %"])
+        with tab1:
+            st.dataframe(leaderboard, use_container_width=True)
+        with tab2:
+            st.dataframe(fastest_growth, use_container_width=True)
+        with tab3:
+            st.dataframe(cancelled, use_container_width=True)
 
 def login():
     st.title("Nu Life Admin App")
