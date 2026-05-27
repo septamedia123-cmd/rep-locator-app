@@ -1952,18 +1952,77 @@ def render_reporting_page(reps_df):
         display_pay_entries = result["pay_entries"].drop(columns=["Path"], errors="ignore")
         st.dataframe(display_pay_entries, use_container_width=True)
 
-        st.subheader("Sample Rep Report Preview")
+        st.subheader("Full Rep Report Review")
+
         sample_paths = result.get("report_file_paths", [])
         if sample_paths:
-            sample_path = sample_paths[0]
-            st.caption(f"Previewing: {os.path.basename(sample_path)}")
-            try:
-                sample_df = pd.read_excel(sample_path, sheet_name=0, header=None, nrows=25)
-                st.dataframe(sample_df, use_container_width=True)
-            except Exception as e:
-                st.warning(f"Could not preview sample workbook: {e}")
+            report_options = {
+                os.path.basename(path): path
+                for path in sample_paths
+                if path and os.path.exists(path)
+            }
+
+            selected_report_name = st.selectbox(
+                "Choose a rep report to review",
+                list(report_options.keys()),
+                key="selected_report_for_admin_review"
+            )
+
+            selected_report_path = report_options.get(selected_report_name)
+
+            if selected_report_path:
+                with open(selected_report_path, "rb") as f:
+                    st.download_button(
+                        "Download Selected Rep Report for Full Excel Review",
+                        data=f,
+                        file_name=selected_report_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+
+                try:
+                    xl = pd.ExcelFile(selected_report_path)
+                    sheet_name = st.selectbox(
+                        "Choose sheet to preview",
+                        xl.sheet_names,
+                        key="selected_sheet_for_admin_review"
+                    )
+
+                    preview_mode = st.radio(
+                        "Preview size",
+                        ["First 50 rows", "First 200 rows", "Entire sheet"],
+                        horizontal=True,
+                        key="admin_preview_size"
+                    )
+
+                    if preview_mode == "First 50 rows":
+                        preview_df = pd.read_excel(selected_report_path, sheet_name=sheet_name, header=None, nrows=50)
+                    elif preview_mode == "First 200 rows":
+                        preview_df = pd.read_excel(selected_report_path, sheet_name=sheet_name, header=None, nrows=200)
+                    else:
+                        preview_df = pd.read_excel(selected_report_path, sheet_name=sheet_name, header=None)
+
+                    st.caption(f"Previewing: {selected_report_name} / {sheet_name}")
+                    st.dataframe(preview_df, use_container_width=True, height=650)
+
+                    sheet_sensitive_hits = []
+                    for col in preview_df.columns:
+                        for value in preview_df[col].head(10).tolist():
+                            if is_sensitive_report_header(value):
+                                sheet_sensitive_hits.append(str(value))
+
+                    if sheet_sensitive_hits:
+                        st.error(
+                            "Sensitive header text appears in this preview: "
+                            + ", ".join(sorted(set(sheet_sensitive_hits)))
+                        )
+                    else:
+                        st.success("No sensitive cost/profit/margin header text detected in the visible preview.")
+
+                except Exception as e:
+                    st.warning(f"Could not preview selected workbook: {e}")
         else:
-            st.info("No sample report path found.")
+            st.info("No rep report files found for review.")
 
         reviewed_sample = st.checkbox("I reviewed the sample rep report preview.", key="reviewed_sample_report")
         reviewed_zip = st.checkbox("I downloaded and reviewed the ZIP if needed.", key="reviewed_zip_package")
