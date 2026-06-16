@@ -1,4 +1,4 @@
-import os
+       import os
 import streamlit as st
 import pandas as pd
 import gspread
@@ -510,6 +510,23 @@ HOWARD_CLIENT_EMAILS = {
     "shannon@innerglowstudiofl.com",
     "roxybarberap@gmail.com",
 }
+
+OWNER_REP_NAME = "Dean Baker"
+
+def is_owner_rep(rep_name):
+    return report_norm(rep_name) == report_norm(OWNER_REP_NAME)
+
+def owner_report_rows(data, headers):
+    """
+    Dean owner payout logic.
+
+    Column W / Sales Rep 1 Commission $ already represents Dean's net owner
+    payout on every transaction after downstream rep payouts have been removed.
+    Therefore Dean's report must use every raw row and exclude only cancelled/dead
+    rows when totaling the Due amount. It must NOT filter to rows where Dean is
+    explicitly listed as Sales Rep 1.
+    """
+    return [row + [""] * (len(headers) - len(row)) for row in data]
 
 def report_clean(value):
     return str(value or "").strip()
@@ -1389,14 +1406,27 @@ def add_sales_insight_tabs(wb, rep_name, source_rows, headers, period, history_d
         "total_rows": total_source_rows,
     }
 
+def read_commission_upload(source_path):
+    """Read the raw commission export from CSV or Excel into rows."""
+    if source_path.lower().endswith(".xlsx"):
+        wb = load_workbook(source_path, read_only=True, data_only=True)
+        ws = wb.active
+        rows = []
+        for row in ws.iter_rows(values_only=True):
+            rows.append(["" if value is None else value for value in row])
+        return rows
+
+    with open(source_path, newline="", encoding="utf-8-sig") as f:
+        return list(csv.reader(f))
+
+
 def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send_live=False, test_email=""):
     temp_root = tempfile.mkdtemp(prefix="nulife_reports_")
     source_path = os.path.join(temp_root, uploaded_file.name)
     with open(source_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    with open(source_path, newline="", encoding="utf-8-sig") as f:
-        rows = list(csv.reader(f))
+    rows = read_commission_upload(source_path)
 
     title = rows[0][0] if rows and rows[0] else "Nu Life Commission Runs"
     headers = rows[1]
@@ -1431,20 +1461,41 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sales_history_df = normalize_history_df(sales_history_df)
 
-    for rep_name in sorted(rep_level_rows.keys(), key=lambda x: x.lower()):
+    report_rep_names = set(rep_level_rows.keys())
+    report_rep_names.add(OWNER_REP_NAME)
+
+    for rep_name in sorted(report_rep_names, key=lambda x: x.lower()):
         wb = Workbook()
         wb.remove(wb.active)
         regular_due = 0.0
         row_count = 0
         cancelled_count = 0
 
-        for level in sorted(rep_level_rows[rep_name].keys()):
-            sheet_name = "Commission Report" if len(rep_level_rows[rep_name]) == 1 else f"Level {level} Report"
-            ws = wb.create_sheet(sheet_name)
-            due, cancelled, count = write_report_sheet(ws, rep_name, level, rep_level_rows[rep_name][level], headers, period)
+        if is_owner_rep(rep_name):
+            # Dean is the owner. Column W already contains his net payout on every
+            # transaction, so his run uses the full raw file and only zeroes out
+            # cancelled/dead accounts.
+            dean_rows = owner_report_rows(data, headers)
+            ws = wb.create_sheet("Owner Commission Report")
+            due, cancelled, count = write_report_sheet(
+                ws,
+                OWNER_REP_NAME,
+                1,
+                dean_rows,
+                headers,
+                period
+            )
             regular_due += due
             cancelled_count += cancelled
             row_count += count
+        else:
+            for level in sorted(rep_level_rows[rep_name].keys()):
+                sheet_name = "Commission Report" if len(rep_level_rows[rep_name]) == 1 else f"Level {level} Report"
+                ws = wb.create_sheet(sheet_name)
+                due, cancelled, count = write_report_sheet(ws, rep_name, level, rep_level_rows[rep_name][level], headers, period)
+                regular_due += due
+                cancelled_count += cancelled
+                row_count += count
 
         override_due = 0.0
         override_note = ""
@@ -1466,9 +1517,13 @@ def build_commission_package(uploaded_file, reps_df, sales_history_df=None, send
 
         # Sales insights and charts for the rep workbook.
         # Uses real order data from the uploaded commission report.
-        all_rep_source_rows = []
-        for level_rows in rep_level_rows[rep_name].values():
-            all_rep_source_rows.extend(level_rows)
+        if is_owner_rep(rep_name):
+            all_rep_source_rows = owner_report_rows(data, headers)
+            override_note = "Owner payout: full raw file, Column W, cancelled/dead rows zeroed"
+        else:
+            all_rep_source_rows = []
+            for level_rows in rep_level_rows[rep_name].values():
+                all_rep_source_rows.extend(level_rows)
 
         if report_norm(rep_name) == "alex bethel":
             corrected_rows = []
@@ -1867,7 +1922,7 @@ def render_reporting_page(reps_df):
     if missing:
         st.warning("Missing Streamlit secrets: " + ", ".join(missing))
 
-    uploaded = st.file_uploader("Upload raw Nu Life commission CSV", type=["csv"])
+    uploaded = st.file_uploader("Upload raw Nu Life commission CSV or Excel", type=["csv", "xlsx"])
 
     c1, c2, c3 = st.columns(3)
     with c1:
