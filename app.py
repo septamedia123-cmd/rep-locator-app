@@ -516,17 +516,55 @@ OWNER_REP_NAME = "Dean Baker"
 def is_owner_rep(rep_name):
     return report_norm(rep_name) == report_norm(OWNER_REP_NAME)
 
+def is_real_order_row(row, headers=None):
+    """
+    Returns True only for actual order/detail rows.
+
+    Some Nu Life exports include a summary/total row directly under the header.
+    That row can have a commission value in Column W but no Order ID / Invoice Number.
+    If we include it in Dean's owner report, the pay report doubles Dean's total:
+    it counts the summary row plus all detail rows.
+
+    Real order rows in these exports have at least one of the order identifiers
+    populated in the first few columns, usually Order ID in Column A or Invoice
+    Number in Column B.
+    """
+    padded = row + [""] * max(0, 6 - len(row))
+
+    order_id = report_clean(padded[0])
+    invoice = report_clean(padded[1])
+    transaction_id = report_clean(padded[2])
+    order_date = report_clean(padded[3])
+    customer_name = report_clean(padded[4])
+
+    # Normal order rows have Order ID and/or Invoice Number.
+    if order_id or invoice:
+        return True
+
+    # Fallback for unusual exports: accept rows with transaction id + customer/date.
+    if transaction_id and (order_date or customer_name):
+        return True
+
+    return False
+
 def owner_report_rows(data, headers):
     """
     Dean owner payout logic.
 
     Column W / Sales Rep 1 Commission $ already represents Dean's net owner
     payout on every transaction after downstream rep payouts have been removed.
-    Therefore Dean's report must use every raw row and exclude only cancelled/dead
-    rows when totaling the Due amount. It must NOT filter to rows where Dean is
-    explicitly listed as Sales Rep 1.
+    Therefore Dean's report must use every REAL raw order row and exclude only
+    cancelled/dead rows when totaling the Due amount. It must NOT filter to rows
+    where Dean is explicitly listed as Sales Rep 1.
+
+    Important: summary/total rows from the export are intentionally skipped.
+    They are not orders and would double-count Dean's payout.
     """
-    return [row + [""] * (len(headers) - len(row)) for row in data]
+    return [
+        row + [""] * (len(headers) - len(row))
+        for row in data
+        if is_real_order_row(row, headers)
+    ]
 
 def report_clean(value):
     return str(value or "").strip()
