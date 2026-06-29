@@ -365,38 +365,157 @@ SUBTOTAL_IDX = 11
 CUSTOMER_EMAIL_IDX = 5
 TRUE_COST_IDX = 44
 
+# Only block true sensitive internal financial HEADERS.
+# This intentionally does NOT scan normal data values such as Stripe payment IDs (pi_...),
+# invoice IDs, order IDs, customer IDs, or transaction IDs.
 SENSITIVE_REPORT_TERMS = [
     "base cost",
-    "base price",
     "true cost",
-    "cost",
+    "product cost",
     "vendor cost",
     "wholesale cost",
     "internal cost",
-    "internal price",
-    "profit",
-    "margin",
+    "cost of goods",
+    "cost of goods sold",
+    "unit cost",
+    "cost each",
+    "cost per unit",
+    "gross profit",
+    "net profit",
+    "profit margin",
+    "gross margin",
+    "net margin",
+    "margin percent",
+    "margin %",
     "markup",
     "cogs",
 ]
 
+SENSITIVE_SINGLE_WORD_HEADERS = {
+    "cost",
+    "profit",
+    "margin",
+    "markup",
+    "cogs",
+}
+
+HEADER_CONTEXT_WORDS = {
+    "order", "orders", "invoice", "customer", "client", "email", "name",
+    "rep", "sales", "sale", "commission", "subtotal", "status", "date",
+    "product", "sku", "quantity", "qty", "amount", "total", "paid",
+    "payout", "override", "revenue", "report", "file", "due", "percent",
+    "percentage", "phone", "address", "state", "city"
+}
+
+def header_scan_norm(value):
+    text = report_clean(value).lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def header_tokens(value):
+    return re.findall(r"[a-z0-9]+", header_scan_norm(value))
+
+def is_likely_identifier_value(value):
+    """
+    Prevent false positives from normal operational IDs.
+
+    Examples:
+    - Stripe PaymentIntent IDs: pi_...
+    - Stripe charge IDs: ch_...
+    - invoices/orders with long IDs
+    """
+    text = header_scan_norm(value)
+
+    if not text:
+        return False
+
+    # Common payment/portal IDs.
+    if re.match(r"^(pi|ch|in|cus|cs|sub|ord|order|inv|txn|tr)_[a-z0-9_]+$", text):
+        return True
+
+    # Long mostly-random IDs should not be treated as headers.
+    compact = re.sub(r"[^a-z0-9]", "", text)
+    if len(compact) >= 14 and re.search(r"\d", compact) and re.search(r"[a-z]", compact):
+        return True
+
+    return False
+
 def is_sensitive_report_header(value):
-    text = report_norm(value)
+    """
+    Returns True only for explicit internal cost/profit/margin style HEADERS.
+    This is intentionally strict to avoid blocking Stripe IDs or normal data values.
+    """
+    text = header_scan_norm(value)
+
+    if not text:
+        return False
+
+    if is_likely_identifier_value(text):
+        return False
+
+    tokens = header_tokens(text)
     compact = re.sub(r"[^a-z0-9]+", "", text)
+
+    # Exact one-word sensitive headers: Cost, Profit, Margin, Markup, COGS.
+    if text in SENSITIVE_SINGLE_WORD_HEADERS:
+        return True
+
+    if len(tokens) == 1 and tokens[0] in SENSITIVE_SINGLE_WORD_HEADERS:
+        return True
+
+    # Explicit phrase headers such as Base Cost, True Cost, Gross Profit, Profit Margin.
     for term in SENSITIVE_REPORT_TERMS:
-        term_norm = term.lower()
+        term_norm = header_scan_norm(term)
         term_compact = re.sub(r"[^a-z0-9]+", "", term_norm)
-        if term_norm in text or term_compact in compact:
+
+        if text == term_norm:
             return True
+
+        # Require phrase boundary matching so random IDs/values do not trigger.
+        if re.search(rf"(^|[^a-z0-9]){re.escape(term_norm)}([^a-z0-9]|$)", text):
+            return True
+
+        # Compact match is allowed only for multi-word terms.
+        if " " in term_norm and term_compact and term_compact in compact:
+            return True
+
     return False
 
 def sensitive_header_indexes(headers):
     return {i for i, h in enumerate(headers) if is_sensitive_report_header(h)}
 
+def row_looks_like_header(values):
+    """
+    Only scan rows that look like header rows, not normal data rows.
+    This prevents false blocks from cells like Stripe pi_... values.
+    """
+    nonempty = [report_clean(v) for v in values if report_clean(v)]
+    if not nonempty:
+        return False
+
+    # Header rows usually have multiple short text labels.
+    headerish_cells = 0
+    for v in nonempty:
+        toks = set(header_tokens(v))
+        if toks & HEADER_CONTEXT_WORDS:
+            headerish_cells += 1
+
+    # Row with multiple known header labels.
+    if headerish_cells >= 2:
+        return True
+
+    # Row with one explicit sensitive header plus at least one other text column nearby.
+    if any(is_sensitive_report_header(v) for v in nonempty) and len(nonempty) >= 2:
+        return True
+
+    return False
+
 def workbook_sensitive_scan(path):
     """
-    Opens a generated workbook and looks for sensitive internal pricing/cost headers.
-    Returns a list of findings.
+    Opens a generated workbook and looks only for explicit sensitive internal
+    pricing/cost/profit/margin HEADERS in likely header rows.
+
+    It does NOT scan normal data values.
     """
     findings = []
     try:
@@ -404,6 +523,10 @@ def workbook_sensitive_scan(path):
         for ws in wb.worksheets:
             max_scan_row = min(ws.max_row, 8)
             for row in ws.iter_rows(min_row=1, max_row=max_scan_row):
+                values = [cell.value for cell in row]
+                if not row_looks_like_header(values):
+                    continue
+
                 for cell in row:
                     if is_sensitive_report_header(cell.value):
                         findings.append({
@@ -2099,8 +2222,12 @@ def render_reporting_page(reps_df):
                     st.dataframe(preview_df, use_container_width=True, height=650)
 
                     sheet_sensitive_hits = []
-                    for col in preview_df.columns:
-                        for value in preview_df[col].head(10).tolist():
+                    preview_scan_rows = preview_df.head(10)
+                    for _, preview_row in preview_scan_rows.iterrows():
+                        row_values = preview_row.tolist()
+                        if not row_looks_like_header(row_values):
+                            continue
+                        for value in row_values:
                             if is_sensitive_report_header(value):
                                 sheet_sensitive_hits.append(str(value))
 
@@ -2120,7 +2247,7 @@ def render_reporting_page(reps_df):
         reviewed_sample = st.checkbox("I reviewed the sample rep report preview.", key="reviewed_sample_report")
         reviewed_zip = st.checkbox("I downloaded and reviewed the ZIP if needed.", key="reviewed_zip_package")
         confirm_no_cost = st.checkbox(
-            "I confirm no Base Cost / Cost / Vendor Cost / True Cost / Profit / Margin columns are visible in rep reports.",
+            "I confirm no Base Cost / True Cost / Vendor Cost / Profit / Margin columns are visible in rep reports.",
             key="confirm_no_cost_columns"
         )
 
